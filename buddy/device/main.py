@@ -272,6 +272,17 @@ def _launch(mod_name):
         _LCD.setTextColor(_GRAY_MID, _BLACK)
         _LCD.drawString("any key to return", 6, _H - 14)
         print("launcher: {} failed: {}".format(mod_name, e))
+        # Drop the half-imported module from sys.modules. Without
+        # this, a second selection of the same app does nothing:
+        # __import__ sees the cached entry and returns immediately
+        # without re-running the module body, so the app's run()
+        # never fires and the user is left staring at a black
+        # screen. Idempotent — KeyError just means the failure
+        # happened before the partial entry was installed.
+        try:
+            del sys.modules[mod_name]
+        except KeyError:
+            pass
         kb = MatrixKeyboard()
         while True:
             kb.tick()

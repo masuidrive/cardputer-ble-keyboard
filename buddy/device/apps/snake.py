@@ -126,7 +126,10 @@ def _intent(k):
     if isinstance(k, int):
         if k == 0x1B:
             return "exit"
-        if k == 0x0D:
+        # Enter reports as 0x0A on this firmware build (per
+        # main.py's launcher); accept 0x0D too in case a future
+        # firmware flips it back to CR.
+        if k in (0x0A, 0x0D):
             return "restart"
         if 0x20 <= k <= 0x7E:
             k = chr(k)

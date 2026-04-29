@@ -121,8 +121,12 @@ class BuddyState:
 
     def stats(self) -> dict:
         total = self.appr + self.deny
-        # Level uses a gentle curve: level 1 at 1 action, level 10 at
-        # 100, level 100 at 10,000 — classic sqrt-style progression.
+        # Triangular progression: each level costs one more action
+        # than the last. Hit points: level 1 at 1 action, level 10
+        # at 55 (=1+2+...+10), level 100 at 5050. The previous
+        # comment mis-described this as a sqrt curve (level 10 at
+        # 100, level 100 at 10000); the loop below is and always
+        # was triangular — only the comment was wrong.
         lvl = 0
         t = total
         while t > 0:

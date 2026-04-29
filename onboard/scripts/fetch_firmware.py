@@ -2,8 +2,9 @@
 
 The manifest endpoint returns the full catalog; we filter by device
 family and flash size, then download the newest UIFlow 2.x release.
-Binaries are cached in the system temp directory so repeated runs
-don't re-download.
+Binaries are cached under a per-user XDG cache dir (mode 0700) so
+repeated runs don't re-download — and so another local user can't
+pre-seed a malicious blob at the predictable cache key.
 """
 
 from __future__ import annotations
@@ -16,14 +17,40 @@ import json
 import os
 import ssl
 import sys
-import tempfile
 import urllib.error
 import urllib.request
 
 MANIFEST_URL = "https://m5burner-api.m5stack.com/api/firmware"
 BINARY_BASE = "https://m5burner.m5stack.com/firmware/"
-# tempfile.gettempdir() is portable: /tmp on Unix, %TEMP% on Windows.
-CACHE_DIR = tempfile.gettempdir()
+
+
+def _cache_dir() -> str:
+    """Per-user firmware cache directory, mode 0700.
+
+    Lives under XDG_CACHE_HOME (or ~/.cache as the fallback) instead of
+    the system temp dir. Two reasons:
+
+      1. /tmp on Linux is world-writable with the sticky bit. The cache
+         filename is deterministically derived from a public manifest
+         field, so before we owned the file, any other local user could
+         have pre-seeded /tmp/uiflow2_<key>.bin with malicious bytes,
+         which the cache-hit shortcut would then have flashed to the
+         device. Per-user 0700 dir closes that vector.
+      2. Cache survives reboots, which the system tmp dir does not — so
+         repeated provisioning of multiple boards skips re-downloads.
+
+    Created with mode 0700 if missing; tightened to 0700 on every call
+    in case it pre-existed at looser perms (chmod is a no-op on
+    Windows, which treats the bits as advisory).
+    """
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    path = os.path.join(base, "m5-onboard")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
 
 
 def _open_https(url: str, timeout: float = 30.0):
@@ -185,7 +212,17 @@ def pick_firmware(manifest: list, variant: str) -> tuple[dict, dict]:
     return entry, version
 
 
-def download(entry: dict, version: dict, dest_dir: str = CACHE_DIR) -> str:
+def _md5_file(path: str) -> bytes:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.digest()
+
+
+def download(entry: dict, version: dict, dest_dir: str | None = None) -> str:
+    if dest_dir is None:
+        dest_dir = _cache_dir()
     file_field = version.get("file")
     if not file_field:
         raise SystemExit(f"Manifest version has no `file` field: {version}")
@@ -194,21 +231,40 @@ def download(entry: dict, version: dict, dest_dir: str = CACHE_DIR) -> str:
     url = BINARY_BASE + file_field + ("" if file_field.endswith(".bin") else ".bin")
     base = file_field[:-4] if file_field.endswith(".bin") else file_field
     dest = os.path.join(dest_dir, f"uiflow2_{base}.bin")
-    if os.path.exists(dest) and os.path.getsize(dest) > 0:
-        return dest
+    sidecar = dest + ".md5"
 
-    # Aliyun OSS sets Content-MD5 (base64'd MD5 of the stored object) on
-    # every blob response. We stream-hash the body and compare so that a
-    # storage-layer corruption or manifest/binary drift is caught before
-    # we hand the bytes to esptool.
+    # Cache-hit path: re-hash the cached binary and compare to the
+    # sidecar we wrote at download time. The sidecar lives in a 0700
+    # cache dir, so only this uid could have placed it there — an
+    # attacker dropping a binary without a matching sidecar falls
+    # straight through to the cache-miss path, which then runs the
+    # live Content-MD5 check against the CDN. Any error here (missing
+    # sidecar, malformed hex, hash mismatch) is treated as a cache
+    # miss; we never raise from the hit path.
+    if os.path.exists(dest) and os.path.exists(sidecar):
+        try:
+            with open(sidecar, "r") as f:
+                expected_hex = f.read().strip()
+            expected = bytes.fromhex(expected_hex)
+            if len(expected) == 16 and _md5_file(dest) == expected:
+                return dest
+        except (OSError, ValueError):
+            pass
+
+    # Cache-miss path. Aliyun OSS sets Content-MD5 (base64'd MD5 of
+    # the stored object) on every blob response. We stream-hash the
+    # body and compare so that a storage-layer corruption or
+    # manifest/binary drift is caught before we hand the bytes to
+    # esptool.
     #
-    # This is integrity-only. MD5 is broken for collision attacks, so it
-    # is NOT a substitute for TLS — it complements the verified-TLS
-    # connection enforced by _open_https(). A CDN that can rewrite both
-    # bytes and headers in tandem is not stopped by this check; pinned
-    # constants would be needed for that, and M5Stack does not publish
-    # signed releases to pin against.
+    # This is integrity-only. MD5 is broken for collision attacks, so
+    # it is NOT a substitute for TLS — it complements the verified-TLS
+    # connection enforced by _open_https(). A CDN that can rewrite
+    # both bytes and headers in tandem is not stopped by this check;
+    # pinned constants would be needed for that, and M5Stack does not
+    # publish signed releases to pin against.
     tmp = dest + ".part"
+    sidecar_tmp = sidecar + ".part"
     h = hashlib.md5()
     try:
         with _open_https(url, timeout=120) as r:
@@ -242,13 +298,21 @@ def download(entry: dict, version: dict, dest_dir: str = CACHE_DIR) -> str:
                 f"expected {expected.hex()}, got {h.hexdigest()}. "
                 "Aborting; partial file removed."
             )
-        # Atomic rename so a half-verified blob never sits at the cache key.
+        # Atomic rename: the binary appears at its cache key only after
+        # verification passes, and the sidecar appears only after the
+        # binary is in place. A crash anywhere in this sequence leaves
+        # a recoverable state (no half-verified blob, no orphan
+        # sidecar pointing at a missing file).
         os.replace(tmp, dest)
+        with open(sidecar_tmp, "w") as f:
+            f.write(h.hexdigest() + "\n")
+        os.replace(sidecar_tmp, sidecar)
     except BaseException:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
+        for path in (tmp, sidecar_tmp):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
         raise
     return dest
 
@@ -263,8 +327,13 @@ def main() -> int:
     )
     ap.add_argument(
         "--dest",
-        default=CACHE_DIR,
-        help=f"Cache directory (default: {CACHE_DIR}).",
+        default=None,
+        help=(
+            "Cache directory. Default: $XDG_CACHE_HOME/m5-onboard/ "
+            "(or ~/.cache/m5-onboard/), created at mode 0700 if missing. "
+            "Override only if you know you need a different location — "
+            "we don't tighten permissions on a path you name explicitly."
+        ),
     )
     args = ap.parse_args()
 

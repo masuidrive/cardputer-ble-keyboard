@@ -184,10 +184,11 @@ def collect_until(
 ) -> str:
     """Keep draining until `sentinel` appears or `timeout` elapses.
 
-    Some scripts (WiFi connect, DNS lookup, TCP connect) print their
-    progress over several seconds. `exec_and_capture`'s single settle
-    delay isn't enough; callers should print a sentinel at the end of
-    their script and then pass it here to wait for completion.
+    Some long-running scripts (large file writes, NVS commits, board
+    reset waits) print their progress over several seconds.
+    `exec_and_capture`'s single settle delay isn't enough; callers
+    should print a sentinel at the end of their script and then pass
+    it here to wait for completion.
     """
     buf = initial
     deadline = time.time() + timeout

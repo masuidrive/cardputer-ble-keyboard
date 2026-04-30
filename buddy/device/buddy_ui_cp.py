@@ -103,6 +103,12 @@ class BuddyUI:
     def __init__(self):
         self._last = {}
         self._passkey = None
+        # Unpair confirmation overlay: True while the host has asked
+        # us to unpair and we're waiting for an on-device Y/N press.
+        # See the threat model in buddy_ble.py — the BLE link is
+        # unauthenticated, so destructive commands need an in-person
+        # confirmation that an in-range BLE attacker can't fake.
+        self._unpair_prompt = False
         self._connection_state = "advertising"
         self._prompt = None
         self._identity_name = "Buddy"
@@ -142,6 +148,24 @@ class BuddyUI:
             return
         self._passkey = None
         self._draw_main()
+
+    def show_unpair_prompt(self):
+        """Show the destructive-action confirmation overlay.
+
+        Repaints the main panel and the hint strip so the only useful
+        keys are Y (confirm) and N (cancel) — Q stays an exit even
+        here, mirroring the passkey overlay's escape hatch.
+        """
+        self._unpair_prompt = True
+        self._draw_unpair_overlay()
+        self.restore_button_hints()
+
+    def clear_unpair_prompt(self):
+        if not self._unpair_prompt:
+            return
+        self._unpair_prompt = False
+        self._draw_main()
+        self.restore_button_hints()
 
     def update_heartbeat(self, hb: dict):
         prev_pending = bool(self._prompt)
@@ -202,6 +226,14 @@ class BuddyUI:
         _LCD.fillRect(0, 112, _W, _H - 112, DARK)
         _LCD.setTextColor(CREAM, DARK)
         _LCD.setTextSize(1)
+        if self._unpair_prompt:
+            # Only Y and N during a destructive-action confirmation;
+            # showing Q here invites a thumb-fumble exit that leaves
+            # the host hanging on a pending ack.
+            _LCD.drawString("Y confirm", 8, 117)
+            n = "N cancel"
+            _LCD.drawString(n, _right(117, 8, n), 117)
+            return
         if self._passkey is not None:
             # During pairing only Q makes sense — Y and N don't
             # actually do anything until the encrypted state fires.
@@ -221,6 +253,7 @@ class BuddyUI:
             self._connection_state in ("advertising", "disconnected")
             and self._passkey is None
             and self._prompt is None
+            and not self._unpair_prompt
         )
 
     def tick_idle_burst(self, frame, last_tick):
@@ -272,6 +305,15 @@ class BuddyUI:
         # Clear from just under the header hairline down to just above
         # the hint strip hairline — leaves those dividers intact.
         _LCD.fillRect(0, 21, _W, 90, BLACK)
+        # Overlays take precedence over the layout under them. The
+        # unpair prompt outranks the passkey because they should never
+        # both be live at once (passkey only fires during a real
+        # pairing flow, which doesn't exist on this build), but
+        # ordering it first means future builds with both don't
+        # accidentally render the wrong thing.
+        if self._unpair_prompt:
+            self._draw_unpair_overlay()
+            return
         if self._passkey is not None:
             self._draw_passkey_overlay()
             return
@@ -343,6 +385,22 @@ class BuddyUI:
         while _LCD.textWidth(hint) > _W - 14 and len(hint) > 1:
             hint = hint[:-1]
         _LCD.drawString(hint, 7, 94)
+
+    def _draw_unpair_overlay(self):
+        if not self._unpair_prompt:
+            return
+        _LCD.fillRect(0, 21, _W, 90, BLACK)
+        _LCD.setTextSize(1)
+        _LCD.setTextColor(RED, BLACK)
+        # Two-line attention header so the destructive nature is clear
+        # at a glance — this is the only path that wipes user state.
+        _LCD.drawString("UNPAIR REQUEST", 6, 28)
+        _LCD.setTextColor(CREAM, BLACK)
+        _LCD.drawString("from connected host.", 6, 46)
+        _LCD.drawString("Wipes name, owner, stats", 6, 64)
+        _LCD.drawString("and disconnects.", 6, 78)
+        _LCD.setTextColor(GRAY_MID, BLACK)
+        _LCD.drawString("Y confirm   N cancel", 6, 96)
 
     def _draw_passkey_overlay(self):
         if self._passkey is None:

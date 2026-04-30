@@ -126,7 +126,10 @@ def _intent(k):
     if isinstance(k, int):
         if k == 0x1B:
             return "exit"
-        if k == 0x0D:
+        # Enter reports as 0x0A on this firmware build (per
+        # main.py's launcher); accept 0x0D too in case a future
+        # firmware flips it back to CR.
+        if k in (0x0A, 0x0D):
             return "restart"
         if 0x20 <= k <= 0x7E:
             k = chr(k)
@@ -286,10 +289,8 @@ def run():
         machine.reset()
 
 
-# UIFlow's App List invokes apps by running the file, not by calling
-# run(). Guard with __name__ so importing this module for inspection
-# doesn't spin up the game loop.
-if __name__ == "__main__":
-    run()
-else:
-    run()
+# UIFlow's App List has been observed to invoke apps both as
+# __main__ and via import. The previous if/else with both arms
+# calling run() was self-cancelling; the empirical behavior is
+# always-run, so just call run() bare.
+run()

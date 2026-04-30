@@ -213,10 +213,8 @@ def run():
         machine.reset()
 
 
-# UIFlow's App List invokes apps by running the file, not by calling
-# run(). Guard with __name__ so importing this module for inspection
-# doesn't spin up the loop.
-if __name__ == "__main__":
-    run()
-else:
-    run()
+# UIFlow's App List has been observed to invoke apps both as
+# __main__ and via import. The previous if/else with both arms
+# calling run() was self-cancelling; the empirical behavior is
+# always-run, so just call run() bare.
+run()

@@ -19,7 +19,7 @@ MicroPython app bundle for the M5Stack Cardputer-Adv. Installed onto `/flash/` b
 
 ## Claude Buddy (BLE)
 
-Open Claude → Developer menu → **Hardware Buddy** → Connect. BLE-only, no WiFi needed anywhere. Stats (approvals / denials / level) persist across reboots via NVS under the `buddy` namespace.
+Open Claude → Developer menu → **Hardware Buddy** → Connect. BLE-only. Stats (approvals / denials / level) persist across reboots via NVS under the `buddy` namespace.
 
 ## Iterating on device code
 
@@ -33,7 +33,7 @@ python3 scripts/push.py --port /dev/cu.usbmodem1101 --files apps/snake.py
 python3 scripts/tail_serial.py --port /dev/cu.usbmodem1101
 
 # One-shot REPL exec
-python3 scripts/repl_run.py --port /dev/cu.usbmodem1101 --cmd "import os; print(os.listdir('/flash'))"
+python3 scripts/repl_run.py --port /dev/cu.usbmodem1101 --script "import os; print(os.listdir('/flash'))"
 ```
 
 `gen_burst_frames.py` regenerates `burst_frames.py` from source sprites.
@@ -41,7 +41,6 @@ python3 scripts/repl_run.py --port /dev/cu.usbmodem1101 --cmd "import os; print(
 ## References
 
 - `references/` — BLE protocol notes for the Claude Buddy app
-- `device-basic-archive/` — older port targeting M5Stack Basic (CH9102, three-button UI); kept for reference, not built anymore
 
 ## License
 

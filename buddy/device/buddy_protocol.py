@@ -35,6 +35,13 @@ FIRMWARE_VERSION = "m5buddy-0.1"
 
 _HEARTBEAT_FIELDS = ("total", "running", "waiting", "tokens", "tokens_today", "entries")
 
+# Unpair is destructive (wipes name/owner/stats and disconnects). The
+# BLE link on UIFlow 2.0 is unauthenticated — see buddy_ble.py — so any
+# central in range could otherwise issue this. We hold the request
+# pending until the user presses Y on the device, or auto-cancel after
+# this many ms.
+_UNPAIR_CONFIRM_TIMEOUT_MS = 30_000
+
 
 class BuddyProtocol:
     """Wire-format bridge between the BLE transport and app state."""
@@ -49,6 +56,11 @@ class BuddyProtocol:
         # which id to answer. None means "nothing pending".
         self._pending = permission_pending or {"id": None, "tool": None, "hint": None}
         self._boot_ms = time.ticks_ms()
+        # Unpair confirmation state. _unpair_pending_ms == 0 means
+        # nothing pending; nonzero is the time.ticks_ms() when the
+        # request arrived. The run loop polls unpair_pending() at its
+        # tick rate, which auto-resolves the timeout.
+        self._unpair_pending_ms = 0
 
     # ----- inbound
 
@@ -79,16 +91,18 @@ class BuddyProtocol:
             self._send({"ack": "owner", "ok": True, "owner": self.state.owner})
             return
         if cmd == "unpair":
-            self._send({"ack": "unpair", "ok": True})
-            # Flush the ack before we tear down the link; a short delay
-            # is usually enough. Proper flow would be "ack, wait for
-            # desktop disconnect, then wipe" but we don't get a signal
-            # for that and the desktop explicitly closes on this ack.
-            time.sleep_ms(200)
-            self.state.reset_all()
-            self.ble.disconnect()
-            self.ble.forget_bonds()
-            self.ui.update_identity(self.state.name, self.state.owner)
+            # Defer the actual wipe until the user confirms on the
+            # device. See _UNPAIR_CONFIRM_TIMEOUT_MS for the threat
+            # model. Re-arming the timer on duplicate requests is fine
+            # — the user just sees the prompt persist.
+            self._unpair_pending_ms = time.ticks_ms() or 1  # avoid 0
+            self.ui.show_unpair_prompt()
+            self._send({
+                "ack": "unpair",
+                "ok": False,
+                "pending": True,
+                "err": "awaiting on-device confirmation",
+            })
             return
         if cmd in ("char_begin", "file", "chunk", "file_end", "char_end"):
             ack = self.chars.handle(msg)
@@ -178,6 +192,57 @@ class BuddyProtocol:
 
     def has_pending(self) -> bool:
         return self._pending.get("id") is not None
+
+    def unpair_pending(self) -> bool:
+        """True iff a host-issued unpair is awaiting on-device Y/N.
+
+        Auto-resolves the timeout: if more than
+        _UNPAIR_CONFIRM_TIMEOUT_MS has elapsed since the request
+        arrived, we clear the pending state and (best-effort) emit a
+        timeout ack so the host UI doesn't spin forever. Safe to call
+        at the run-loop tick rate; idempotent until the next unpair
+        request arrives.
+        """
+        if not self._unpair_pending_ms:
+            return False
+        elapsed = time.ticks_diff(time.ticks_ms(), self._unpair_pending_ms)
+        if elapsed > _UNPAIR_CONFIRM_TIMEOUT_MS:
+            self._unpair_pending_ms = 0
+            self.ui.clear_unpair_prompt()
+            # Best-effort ack; if the host is already gone the send
+            # just no-ops. Timeout is a normal outcome, not an error.
+            self._send({
+                "ack": "unpair",
+                "ok": False,
+                "timed_out": True,
+                "err": "no on-device confirmation",
+            })
+            return False
+        return True
+
+    def confirm_unpair(self) -> None:
+        """User pressed Y at the device — actually wipe state."""
+        if not self.unpair_pending():
+            return
+        self._unpair_pending_ms = 0
+        # Ack first while the link is still up; the desktop closes on
+        # this ack, so we send before tearing down. 200ms flush window
+        # mirrors the original (pre-confirmation) flow.
+        self._send({"ack": "unpair", "ok": True, "confirmed": True})
+        time.sleep_ms(200)
+        self.state.reset_all()
+        self.ble.disconnect()
+        self.ble.forget_bonds()
+        self.ui.clear_unpair_prompt()
+        self.ui.update_identity(self.state.name, self.state.owner)
+
+    def cancel_unpair(self) -> None:
+        """User pressed N at the device — clear pending, notify host."""
+        if not self.unpair_pending():
+            return
+        self._unpair_pending_ms = 0
+        self.ui.clear_unpair_prompt()
+        self._send({"ack": "unpair", "ok": False, "cancelled": True})
 
     def _build_status_ack(self) -> dict:
         import gc

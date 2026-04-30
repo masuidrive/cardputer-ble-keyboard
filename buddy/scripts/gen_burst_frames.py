@@ -27,7 +27,6 @@ from PIL import Image
 
 
 _ROOT = Path(__file__).resolve().parent.parent
-_DEFAULT_SRC = Path("/Users/24g/Downloads/waiting.webp")
 _DEFAULT_DEST = _ROOT / "device" / "burst_frames.py"
 
 # Canonical size chosen to fit every on-device placement (launcher
@@ -82,7 +81,12 @@ def _encode_frame(img: Image.Image) -> tuple[bytes, int, int, int, int]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--src", type=Path, default=_DEFAULT_SRC)
+    ap.add_argument(
+        "--src",
+        type=Path,
+        required=True,
+        help="Path to the animated WebP to encode (e.g. waiting.webp).",
+    )
     ap.add_argument("--dest", type=Path, default=_DEFAULT_DEST)
     ap.add_argument("--frame-ms", type=int, default=80)
     args = ap.parse_args()

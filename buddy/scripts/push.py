@@ -34,13 +34,23 @@ except ImportError:
     raise
 
 
+# Default file set when --files isn't passed. Lists every *.py
+# under buddy/device/ (root + apps/) that ships on the device. The
+# previous list referenced "buddy_ui.py" — that module was renamed
+# to buddy_ui_cp.py during the Cardputer port and the rename never
+# made it here, so a default invocation immediately failed with
+# "no such file or directory".
 DEFAULT_FILES = [
     "main.py",
     "buddy_ble.py",
-    "buddy_ui.py",
+    "buddy_ui_cp.py",
     "buddy_state.py",
     "buddy_chars.py",
     "buddy_protocol.py",
+    "burst_frames.py",
+    "apps/claude_buddy.py",
+    "apps/hello_cardputer.py",
+    "apps/snake.py",
 ]
 
 CHUNK_BYTES = 512  # source bytes per paste-mode write
@@ -83,7 +93,13 @@ def _paste(s: serial.Serial, script: str, settle: float = 0.3) -> str:
 
 
 def _upload_file(s: serial.Serial, src_path: str, dest_name: str) -> None:
-    """Copy src_path → /flash/<dest_name> on the device."""
+    """Copy src_path → /flash/<dest_name> on the device.
+
+    Handles a single subdirectory in dest_name (e.g. "apps/foo.py")
+    by mkdir-ing it on the device first if it doesn't exist. We only
+    support one level because that's all the bundle layout uses;
+    nested layouts (apps/sub/foo.py) would need to walk the path.
+    """
     with open(src_path, "rb") as f:
         data = f.read()
 
@@ -91,10 +107,14 @@ def _upload_file(s: serial.Serial, src_path: str, dest_name: str) -> None:
     # the file handle alive across paste-mode blocks works because
     # paste-mode runs each Ctrl-D block in the same REPL globals
     # namespace.
-    head = (
-        "import ubinascii\n"
-        'fp = open("/flash/{}", "wb")\n'.format(dest_name)
-    )
+    head_lines = ["import ubinascii"]
+    if "/" in dest_name:
+        sub = dest_name.rsplit("/", 1)[0]
+        head_lines.append("import uos")
+        head_lines.append("try: uos.stat('/flash/{}')".format(sub))
+        head_lines.append("except OSError: uos.mkdir('/flash/{}')".format(sub))
+    head_lines.append('fp = open("/flash/{}", "wb")'.format(dest_name))
+    head = "\n".join(head_lines) + "\n"
     out = _paste(s, head, settle=0.2)
     if "Error" in out or "Traceback" in out:
         raise RuntimeError("failed to open dest file:\n" + out)

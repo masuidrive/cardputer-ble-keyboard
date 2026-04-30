@@ -1,31 +1,48 @@
-"""Nordic UART Service (NUS) peripheral with encrypted pairing.
+"""Nordic UART Service (NUS) peripheral — UNAUTHENTICATED on UIFlow 2.0.
 
-The Claude Buddy protocol is defined as a Nordic UART Service over BLE
-with UTF-8 JSON lines framed by '\\n'. Pairing is DisplayOnly-IO with a
-6-digit passkey — the device shows it on the LCD, the host operator
-types it. All GATT operations on RX/TX require an encrypted+MITM link,
-which forces every connection through the pairing flow before any data
-flows. This is the only layer that touches the bluetooth module; the
-protocol module only deals with complete lines.
+The Claude Buddy wire protocol is Nordic UART (line-delimited UTF-8
+JSON with '\\n' terminators). On a build with the MicroPython BLE
+pairing API, this layer would drive a DisplayOnly passkey flow and
+require an encrypted+MITM link before dispatching writes. UIFlow 2.0
+ships a stripped MicroPython BLE that exposes neither the
+encrypted-flag characteristic setters nor the IO_CAPABILITY config,
+so the link this module actually offers is plain GATT — any BLE
+central in range can write to the RX characteristic and read TX
+notifications. The encryption-flag and passkey IRQ branches below
+stay in the file so they light up automatically on any future build
+that restores the pairing API; today they are dormant and
+``pairing_supported`` is hard-coded False.
 
-Two subtleties worth calling out:
+Defenses on this build live above the BLE layer:
+
+- The file-receive protocol (``char_*``/``file``/``chunk``/
+  ``file_end``) is rejected outright — see ``buddy_chars.py``.
+- Destructive control commands (currently just ``unpair``) require
+  on-device button confirmation before they take effect — see
+  ``buddy_protocol.py``.
+- ``status`` / ``name`` / ``owner`` / heartbeats remain open over
+  the unauthenticated link; ``sec`` in the status ack reflects the
+  actual encryption state (``False`` here) so the host can render
+  that honestly to the user.
+
+Two implementation subtleties worth calling out:
 
 - MicroPython's IRQ handler runs in scheduler context. Keep the body
   short: buffer bytes, split on '\\n', hand completed lines to the
-  callback. Heavy parsing inside the IRQ has in the past caused dropped
-  writes on ESP32 when subsequent notifications arrived before we
-  returned.
+  callback. Heavy parsing inside the IRQ has in the past caused
+  dropped writes on ESP32 when subsequent notifications arrived
+  before we returned.
 
-- The advertising payload can't fit both the 128-bit NUS UUID and the
-  full "Claude_XXXXXX" local name (3+18+2+13 = 36 > 31 bytes). Putting
-  the service UUID in adv_data and the name in scan-response data is
-  the standard workaround and is what the desktop side expects — it
-  filters on name prefix via an active scan.
+- The advertising payload can't fit both the 128-bit NUS UUID and
+  the full "Claude_XXXXXX" local name (3+18+2+13 = 36 > 31 bytes).
+  Putting the service UUID in adv_data and the name in scan-response
+  data is the standard workaround and is what the desktop side
+  expects — it filters on name prefix via an active scan.
 """
 
 import bluetooth
 import micropython
-import random
+import os
 import time
 from micropython import const
 
@@ -72,8 +89,7 @@ def _mac_suffix(mac_bytes: bytes) -> str:
 
     The desktop-side scanner matches on the prefix "Claude_" and uses
     the suffix to distinguish multiple buddies. 6 hex chars gives us
-    16M unique names, which is plenty even if every dev at Anthropic
-    builds one.
+    16M unique names, plenty for any plausible deployment.
     """
     return "".join("{:02X}".format(b) for b in mac_bytes[-3:])
 
@@ -105,8 +121,8 @@ def _ensure_stack(name_prefix: str):
     Buddy app, etc. Only permissive scanners like LightBlue still
     see it.
 
-    The sequence that empirically avoids the lockup on device
-    3c:0f:02:e8:7d:ba:
+    The sequence that empirically avoids the lockup on the
+    Cardputer-Adv test units we developed against:
 
       1. active(True)
       2. config(gap_name=...)
@@ -127,15 +143,13 @@ def _ensure_stack(name_prefix: str):
 
     ble = bluetooth.BLE()
 
-    # Diagnostic: record what UIFlow left the stack in before our
-    # init runs. Helps root-cause any further "advertising works from
-    # REPL but not when launched as a UIFlow app" regressions.
+    # The launcher and other apps may have left the stack in various
+    # states; only call active(True) if it isn't already, since the
+    # init transition is what tends to wedge the controller.
     try:
         pre_active = ble.active()
-    except Exception as e:
-        pre_active = "?: {}".format(e)
-    print("buddy_ble: stack pre-init active:", pre_active)
-
+    except Exception:
+        pre_active = False
     if not pre_active:
         ble.active(True)
     # Brief settle — premature config calls can race with the
@@ -182,7 +196,9 @@ def _ensure_stack(name_prefix: str):
 
 
 class BuddyBLE:
-    """BLE peripheral serving Nordic UART with encrypted pairing."""
+    """BLE peripheral serving Nordic UART. Unauthenticated on UIFlow 2.0;
+    see the module docstring for the threat model and where the
+    application-layer defenses live."""
 
     def __init__(
         self,
@@ -312,8 +328,13 @@ class BuddyBLE:
             if action == _PASSKEY_ACTION_DISP:
                 # Generate a fresh 6-digit key per pairing attempt —
                 # reusing one across reboots would let a shoulder-surf
-                # from last week still work.
-                pk = random.randint(0, 999_999)
+                # from last week still work. Backed by os.urandom (the
+                # ESP32 hardware RNG core), not random.randint (Mersenne
+                # Twister, predictable from a few outputs and unfit for
+                # a pairing secret an attacker can observe over the air).
+                # uint32 % 1_000_000 has ~2e-7 modulo bias across the
+                # 1_000_000 buckets — negligible for a 6-digit passkey.
+                pk = int.from_bytes(os.urandom(4), "big") % 1_000_000
                 self._current_passkey = pk
                 self._on_passkey(pk)
                 self._ble.gap_passkey(conn, action, pk)

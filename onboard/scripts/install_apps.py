@@ -1,9 +1,9 @@
 """Install a bundle of MicroPython .py files onto /flash/ on the device.
 
-This is the third provisioning step beyond "flash firmware" and "set
-WiFi": it copies the user's app sources onto the device so it boots
-into their software instead of UIFlow's pairing screen. Think of it
-as provisioning the *payload* that runs on top of UIFlow.
+This is the second step after "flash firmware": it copies the user's
+app sources onto the device so it boots into their software instead
+of UIFlow's pairing screen. Think of it as provisioning the *payload*
+that runs on top of UIFlow.
 
 ### Source layout → device layout
 
@@ -390,17 +390,53 @@ def install(
 # instead of a full path. Extend as more bundles graduate from
 # "scratch project" to "thing I want on every new M5 I provision".
 #
-# Paths here are built with os.path.expanduser and os.path.join so
-# they resolve correctly on macOS, Linux, and Windows (where ``~``
-# expands to ``C:\Users\<user>\`` and separators are normalized).
-# Users who keep their bundle somewhere other than ~/Downloads can
-# override the location with the ``M5_BUDDY_DIR`` environment
-# variable — useful on hosts where Downloads is localized (e.g.
-# "Téléchargements" on French-locale Windows) or otherwise lives
-# on a different drive.
-_DEFAULT_BUDDY_DIR = os.path.join(
-    os.path.expanduser("~"), "Downloads", "m5stack", "buddy", "device"
-)
+# Resolution order for the ``buddy`` shorthand (first hit wins):
+#   1. ``$M5_BUDDY_DIR`` if set — explicit override, always wins.
+#      Useful for unusual setups: bundle on a different drive,
+#      monorepo at a custom path, OneDrive-redirected Downloads, etc.
+#   2. Script-relative ``<repo>/buddy/device``. Walks up two levels
+#      from this file (``onboard/scripts/install_apps.py`` →
+#      ``<repo>/`` → ``<repo>/buddy/device``) so the bundle is
+#      found regardless of where the repo was cloned. Uses
+#      ``os.path.realpath(__file__)`` so the skill's symlink at
+#      ``~/.claude/skills/m5-onboard/`` resolves to the real clone
+#      before walking. This is the path that should hit on every
+#      normal install — clone anywhere, it works.
+#   3. Conventional clone locations under ``~`` for users who
+#      cloned to a path the script itself isn't in (e.g. running
+#      install_apps.py from a copy somewhere weird while the
+#      bundle lives in a familiar spot):
+#         ~/Downloads/m5stack/buddy/device
+#         ~/Desktop/m5stack/buddy/device
+#
+# If none of the candidates exist on disk, we still return (1)/(2) so
+# the eventual error message points at where we'd have looked first
+# — typically the script-relative path, which is the most useful
+# breadcrumb for "I cloned the repo and the bundle is missing."
+
+def _candidate_buddy_dirs() -> list[str]:
+    cands: list[str] = []
+    here = os.path.dirname(os.path.realpath(__file__))
+    cands.append(
+        os.path.normpath(os.path.join(here, "..", "..", "buddy", "device"))
+    )
+    home = os.path.expanduser("~")
+    cands.append(os.path.join(home, "Downloads", "m5stack", "buddy", "device"))
+    cands.append(os.path.join(home, "Desktop", "m5stack", "buddy", "device"))
+    return cands
+
+
+def _default_buddy_dir() -> str:
+    for c in _candidate_buddy_dirs():
+        if os.path.isdir(c):
+            return c
+    # Fall back to the first (script-relative) so an "missing bundle"
+    # error mentions a path the user is likely to recognize as
+    # "oh, that's inside my checkout."
+    return _candidate_buddy_dirs()[0]
+
+
+_DEFAULT_BUDDY_DIR = _default_buddy_dir()
 KNOWN_BUNDLES = {
     "buddy": os.environ.get("M5_BUDDY_DIR") or _DEFAULT_BUDDY_DIR,
 }

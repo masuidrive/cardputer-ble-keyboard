@@ -102,22 +102,24 @@ def _intent_for_key(k):
 
     MatrixKeyboard.get_key() on this UIFlow 2.0 build hands back the
     raw ASCII byte value as an **int** — e.g. 0x59 for 'Y', 0x6E for
-    'n', 0x0D for Enter, 0x1B for Escape. This is different from some
-    older builds where it returned a length-1 string, so we accept
-    both forms: ints in the printable range 0x20..0x7E are converted
-    to their single-char string and then fall through to the string
-    matcher below. That way we get one place that enumerates the
-    key→intent map.
+    'n', 0x1B for Escape. Enter on this firmware reports as 0x0A
+    (LF), not 0x0D (CR) — main.py:_intent_for_key in the launcher
+    has the same accommodation. We accept both 0x0A and 0x0D so a
+    future build that flips back doesn't silently break Enter here.
+    Older builds returned a length-1 string instead; accepted too.
+    Ints in the printable range 0x20..0x7E are converted to their
+    single-char string and fall through to the string matcher below.
 
     The previous version of this function treated every int except
     0x0D / 0x1B as unknown, which silently dropped every Y/N/Q press
     — that's the "keyboard buttons don't work" symptom we saw on
-    hardware.
+    hardware. The Enter-key bug behind it (0x0A reports as not-0x0D)
+    is what motivates the explicit (0x0A, 0x0D) check here too.
     """
     if k is None:
         return None
     if isinstance(k, int):
-        if k == 0x0D:
+        if k in (0x0A, 0x0D):
             return _INTENT_APPROVE
         if k == 0x1B:
             return _INTENT_QUIT
@@ -161,13 +163,24 @@ def run():
     def on_passkey(pk):
         ui.show_passkey(pk)
 
+    # Pre-bind so on_state_change's closure can resolve `ble` even if
+    # the IRQ fires during BuddyBLE.__init__ (the irq handler is
+    # wired up before _advertise() runs, so a central that connects
+    # mid-init can deliver _IRQ_CENTRAL_CONNECT before the
+    # `ble = BuddyBLE(...)` assignment below completes). Without this
+    # pre-bind, on_state_change raises NameError in IRQ context and
+    # the link is silently lost. The `is None` guard means the very
+    # first event during init won't get the pairing-aware remap, but
+    # any subsequent event will — and the run loop stays alive.
+    ble = None
+
     def on_state_change(s):
         # The stripped UIFlow 2.0 BLE build doesn't fire
         # _IRQ_ENCRYPTION_UPDATE, so "connected" is terminal. Remap
         # it to "encrypted" so the UI advances past the PAIR... badge
         # and the protocol starts emitting its hello.
         effective = s
-        if s == "connected" and not ble.pairing_supported:
+        if s == "connected" and ble is not None and not ble.pairing_supported:
             effective = "encrypted"
         print("claude_buddy: state", s, "->", effective)
         ui.set_connection(effective)
@@ -214,18 +227,35 @@ def run():
             k = kb.get_key()
             intent = _intent_for_key(k)
 
+            # An active unpair confirmation outranks any permission
+            # prompt: pressing Y here means "yes, wipe me", not "yes,
+            # approve the pending tool call". The unpair_pending()
+            # check is also where the protocol layer rolls over the
+            # 30s timeout, so we want it called every loop iteration
+            # regardless of what key (if any) was pressed.
+            unpair_active = proto.unpair_pending()
+
             if intent == _INTENT_APPROVE:
-                if not proto.send_permission("once"):
+                if unpair_active:
+                    proto.confirm_unpair()
+                elif not proto.send_permission("once"):
                     ui.flash_toast("Y: no prompt", buddy_ui.GRAY_DIM)
                     ui.update_footer(state.stats(), _stub_battery())
                 last_toast_ms = time.ticks_ms()
             elif intent == _INTENT_DENY:
-                if not proto.send_permission("deny"):
+                if unpair_active:
+                    proto.cancel_unpair()
+                elif not proto.send_permission("deny"):
                     ui.flash_toast("N: no prompt", buddy_ui.GRAY_DIM)
                 last_toast_ms = time.ticks_ms()
             elif intent == _INTENT_QUIT:
                 # Break out so the `finally` block tears BLE down
-                # cleanly before we reboot back to the launcher.
+                # cleanly before we reboot back to the launcher. If
+                # an unpair is pending, leaving without confirming
+                # cancels it on the device side; the host already has
+                # an "ok:false,pending:true" ack and a subsequent
+                # disconnect will tell it the request didn't go
+                # through.
                 return
 
             now = time.ticks_ms()
@@ -264,14 +294,13 @@ def run():
         machine.reset()
 
 
-# UIFlow's App List invokes user apps by running the file, not by
-# calling run(). Guard with __name__ so importing this module for
-# tests/inspection doesn't immediately spin up BLE.
-if __name__ == "__main__":
-    run()
-else:
-    # When the launcher imports us (vs. runs us as __main__), call run()
-    # explicitly. UIFlow 2.4.x has been observed to do both depending on
-    # how the app was selected; calling run() from here is idempotent
-    # because run() itself is the only place that wires BLE up.
-    run()
+# UIFlow 2.4.x's App List has been observed to invoke apps both as
+# __main__ (file run directly) and via import (when picked through
+# the menu vs. the file system, depending on version). The previous
+# if/else with both arms calling run() was just dispatching to
+# itself; collapse it so the empirical behavior is the documented
+# behavior. The trade-off is that anyone who imports this module
+# from CPython for inspection will trigger a BLE init — but the
+# imports above (M5, hardware, bluetooth) already only resolve
+# on-device, so that path isn't a real use case.
+run()

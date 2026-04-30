@@ -4,16 +4,6 @@ Detect -> identify -> fetch firmware -> flash -> (optional apps
 install). Each stage prints its status so the user can see progress
 over what takes a couple of minutes in total.
 
-The apps we ship (Claude Buddy, Snake, Hello) run on BLE / USB only,
-so WiFi provisioning is out of scope for this skill. A standalone
-``configure_wifi.py`` still exists in the scripts directory for the
-rare case where someone wants to add WiFi to an already-provisioned
-device after the fact — but it's not part of the default onboarding
-flow, and it's not exposed through ``onboard.py`` flags anymore.
-Tightening the scope this way removed a surface area that was
-error-prone (SSID case-sensitivity, NVS key-type gotchas) and was
-being carried on every provision for little practical benefit.
-
 This is the entrypoint. Works on macOS (``/dev/cu.usbmodem*``),
 Linux (``/dev/ttyACM*`` / ``/dev/ttyUSB*``), and Windows (``COMx``)
 — pyserial abstracts the port-name differences, and the skill's
@@ -33,6 +23,7 @@ import importlib.util
 import os
 import shutil
 import subprocess
+import random
 import sys
 import threading
 import time
@@ -94,15 +85,86 @@ def banner(msg: str) -> None:
     sys.stderr.flush()
 
 
+# Per-stage flavor for the every-15-seconds heartbeat. Each pool is
+# shuffled once per Heartbeat instance and walked in order, so within
+# a run you don't see the same quip twice until the pool is exhausted.
+# Across runs the order differs. Lines are written to be whimsical
+# but anchored to what's actually happening on the wire — never
+# misleading about success or failure, since the Heartbeat thread is
+# only alive while the stage is making forward progress.
+_HEARTBEAT_QUIPS: dict[str, tuple[str, ...]] = {
+    "DETECT": (
+        "Asking the OS what's plugged in.",
+        "Filtering USB-UART bridges and native-USB ESP32-S3 devices.",
+        "Probing the chip identity over esptool.",
+        "Looking for a friendly silicon face on the bus.",
+    ),
+    "FETCH FIRMWARE": (
+        "Pulling firmware from M5Stack's CDN.",
+        "Bytes are arriving from across the Pacific.",
+        "Streaming the binary, hashing as we go. Nothing slips past the MD5.",
+        "Aliyun OSS is shipping firmware, one packet at a time.",
+        "Caching to ~/.cache/m5-onboard/ so the next run is faster.",
+        "Verifying Content-MD5 in flight; corrupt bytes don't make the cut.",
+    ),
+    "FLASH": (
+        "Whispering UIFlow into the chip's silicon ear.",
+        "Bytes are arriving. Bytes are settling in. None are going home.",
+        "The ROM bootloader is being agreeable, sector by sector.",
+        "Erasing the past. Writing the future. Don't unplug the time machine.",
+        "Painting fresh firmware over the old. The chip is patient.",
+        "Negotiating with flash storage. It signs every page in triplicate.",
+        "ESP32-S3 is reading its new instruction manual, one chapter at a time.",
+        "The chip and esptool are performing a careful, rehearsed dance.",
+        "Sectors are being prepared with the dignity of a librarian.",
+        "115200 baud, no stub. Slow and steady. The hare lost this race.",
+    ),
+    "RESTORE BOOT.PY": (
+        "Tucking the stock UIFlow boot.py into a safe drawer.",
+        "Backing up the original boot path before our launcher takes over.",
+        "Preserving the factory state. Just in case you change your mind.",
+        "Saving boot_uiflow.py — your escape hatch back to UIFlow.",
+    ),
+    "INSTALL APPS": (
+        "Beaming Python source through the REPL pipe, one file at a time.",
+        "MicroPython is filing its new apps with quiet enthusiasm.",
+        "Files are landing in /flash/ like paper airplanes in a gym.",
+        "Dictating Python to a very polite listener.",
+        "Each file gets its own little ceremony before the next.",
+        "Paste mode is the slowest courier with the cleanest handwriting.",
+        "Bytes over UART. The wire never complains.",
+        "Base64-decoded chunks are arriving at the device, in order.",
+        "Writing apps that the launcher will discover on next boot.",
+        "MicroPython is opening files and writing bytes. Small life, good life.",
+    ),
+}
+
+
+def _quips_for_stage(stage: str) -> list[str]:
+    """Return a copy of the matching pool, or [] if no prefix matches.
+
+    Match by prefix so labels with parenthetical suffixes — e.g.
+    "FETCH FIRMWARE (cardputer-adv)" or "FLASH (write)" — still
+    resolve to the right pool.
+    """
+    for prefix, lines in _HEARTBEAT_QUIPS.items():
+        if stage.startswith(prefix):
+            return list(lines)
+    return []
+
+
 class Heartbeat:
-    """Background thread that prints elapsed time for a stage every N seconds.
+    """Background thread that prints a stage-flavored "still alive" tick
+    every N seconds.
 
     Stages like FETCH FIRMWARE (network download), FLASH (esptool runs
     its own progress, but the post-flash wait and port re-enumeration
     can sit quiet for seconds), and the button-dance phases can go
     quiet long enough to look hung. A 15 s tick from a daemon thread
     gives a steady "still alive, here's where we are" signal without
-    touching the stage's own logic.
+    touching the stage's own logic. The line includes a whimsical
+    quip from the matching pool so 8 minutes of FLASH doesn't read
+    like a stuck process — see ``_HEARTBEAT_QUIPS``.
 
     Use as a context manager — the thread stops when the block exits,
     even on exception.
@@ -114,11 +176,35 @@ class Heartbeat:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._start = 0.0
+        # Shuffle the matching quip pool once per instance so the
+        # tick-by-tick sequence is round-robin (no immediate repeats)
+        # but unpredictable across runs.
+        self._quips = _quips_for_stage(stage)
+        random.shuffle(self._quips)
+        self._quip_idx = 0
+
+    def _next_quip(self) -> str:
+        if not self._quips:
+            return ""
+        q = self._quips[self._quip_idx % len(self._quips)]
+        self._quip_idx += 1
+        return q
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
             elapsed = int(time.monotonic() - self._start)
-            sys.stderr.write(f"  [heartbeat] {self.stage} — {elapsed}s elapsed\n")
+            quip = self._next_quip()
+            if quip:
+                sys.stderr.write(
+                    f"  [heartbeat {self.stage} {elapsed}s] {quip}\n"
+                )
+            else:
+                # Stages without a matching pool (future additions, custom
+                # callers) keep the old plain-text format so monitoring
+                # filters that only look for "[heartbeat" still match.
+                sys.stderr.write(
+                    f"  [heartbeat] {self.stage} — {elapsed}s elapsed\n"
+                )
             sys.stderr.flush()
 
     def __enter__(self) -> "Heartbeat":
@@ -493,10 +579,55 @@ def _wait_for_any_usbmodem(current_port: str, timeout: float = 20.0) -> str | No
 # first, run pip if the user agrees, and only then import the rest of the
 # pipeline.
 
+# Minimum esptool version we need. flash.py invokes esptool with
+# `--after watchdog_reset`, which was added in esptool 4.8. Older
+# esptool fails mid-flash with an opaque argparse error AFTER the
+# button dance, which is the worst possible time. Bumped to 4.8 as
+# the floor; requirements.txt pins >= 4.11 for the version we test
+# against.
+_MIN_ESPTOOL = (4, 8)
+
+
 def _pyserial_present() -> bool:
     # find_spec doesn't execute the package, so it's safe even if pyserial
     # has broken init — we only care whether it's importable at all.
     return importlib.util.find_spec("serial") is not None
+
+
+def _esptool_version() -> tuple[int, ...] | None:
+    """Return (major, minor, ...) tuple if esptool is importable; None otherwise.
+
+    Tolerates non-numeric suffixes (e.g. ``4.8.0.dev0``) by stopping at
+    the first non-digit in each component. Used by the preflight to
+    detect installs that are too old to support the esptool flags
+    flash.py uses.
+    """
+    try:
+        import esptool  # noqa: F401
+    except Exception:
+        # Importing esptool runs its top-level code, which can fail in
+        # weird ways on broken installs (missing transitive deps, etc).
+        # Treat any import failure as "version unknown" rather than
+        # crashing here.
+        return None
+    raw = getattr(esptool, "__version__", "")
+    parts: list[int] = []
+    for piece in raw.split(".")[:3]:
+        digits = ""
+        for ch in piece:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) if parts else None
+
+
+def _esptool_version_str() -> str:
+    v = _esptool_version()
+    return ".".join(str(x) for x in v) if v else "unknown"
 
 
 def _esptool_path_candidates() -> list[str]:
@@ -531,63 +662,166 @@ def _esptool_path_candidates() -> list[str]:
 
 
 def _esptool_present() -> bool:
+    # Importable check first: flash.py invokes esptool via
+    # ``python -m esptool`` (subprocess inherits user-site), so
+    # importability is what actually matters. The binary hunt below
+    # is a backstop for environments where esptool only landed in a
+    # bin/Scripts directory and the importable module isn't on
+    # sys.path for some reason.
+    if importlib.util.find_spec("esptool") is not None:
+        return True
     for name in ("esptool.py", "esptool", "esptool.exe"):
         if shutil.which(name):
             return True
     return any(os.path.isfile(p) for p in _esptool_path_candidates())
 
 
-def _preflight() -> None:
-    """Ensure pyserial + esptool are importable; install via pip only
-    if the bundled vendor/ is missing AND the user's environment also
-    doesn't have them.
+def _check_port_access(port: str) -> None:
+    """On Linux, refuse to continue with an inaccessible port and
+    surface the specific group the user is missing from.
 
-    The goal is "clone the skill and go" — zero additional install
-    steps. With ``scripts/vendor/`` present (the default shipping
-    configuration), both deps are already on ``sys.path`` via the
-    ``vendor_path.ensure_on_syspath()`` call at the top of this file,
-    and we just verify the imports resolve. No pip prompt, no network
-    call, nothing.
+    Without this, port-open fails ~30 seconds later as a generic
+    ``PermissionError: [Errno 13]`` deep inside pyserial — opaque
+    enough that it sends new attendees down a 20-minute "is the
+    cable bad?" detour. The fix is documented in SKILL.md, but a
+    programmatic check forces it into the user's first 5 seconds
+    of output.
 
-    If somebody pruned ``vendor/`` (downloaded a zip without it, ran
-    a shallow clone that excluded it, deliberately trimmed to reduce
-    repo size) we fall back to the pre-vendor behavior: check if
-    pyserial / esptool are importable from the user's environment,
-    and if not, offer to pip-install them.
+    No-op on macOS and Windows: there's no equivalent group-gate
+    on those platforms, and the path checks below would false-
+    positive for COMx which doesn't show up in the filesystem.
     """
-    # Vendor is present and importable? Great — we're done. No network,
-    # no prompts, no version drift. Surface the state once so the
-    # provisioning log is honest about where the deps came from.
-    if vendor_path.is_available() and _pyserial_present() and _esptool_present():
+    if sys.platform != "linux":
+        return
+    if not port or not os.path.exists(port):
+        # pick_port handles "no port found" already; if we got here
+        # with a missing path, defer to the next stage's error.
+        return
+    if os.access(port, os.R_OK | os.W_OK):
+        return
+    # Resolve the group name that owns the device node so the fix
+    # we suggest is specific to the user's distro (dialout on
+    # Debian/Ubuntu/Arch, uucp on Fedora/RHEL).
+    grp_name = "dialout"
+    try:
+        import grp
+        gid = os.stat(port).st_gid
+        grp_name = grp.getgrgid(gid).gr_name
+    except Exception:
+        pass
+    sys.stderr.write(
+        "\nERROR: cannot read/write {port}.\n"
+        "On Linux this means you're not in the '{grp}' group.\n"
+        "Fix once, long-term:\n"
+        "  sudo usermod -aG {grp} $USER\n"
+        "  # then log out and log back in (group changes take effect\n"
+        "  # for new sessions only — a new terminal is not enough)\n"
+        "Or as a one-off, prefix this command with sudo. The skill\n"
+        "doesn't need root for anything else, so the group fix is\n"
+        "strictly better.\n".format(port=port, grp=grp_name)
+    )
+    sys.exit(2)
+
+
+def _requirements_path() -> str:
+    """Absolute path to the repo-root requirements.txt.
+
+    Two levels up from this file: ``onboard/scripts/onboard.py`` →
+    ``onboard/`` → repo root. Stable across the canonical
+    ``~/Downloads/m5stack/`` and any clone-elsewhere setup.
+    """
+    return os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "requirements.txt")
+    )
+
+
+def _preflight() -> None:
+    """Ensure pyserial + esptool are importable AND esptool is recent enough;
+    install via pip from requirements.txt if anything is missing or stale.
+
+    Three failure modes we explicitly guard against, all surfaced
+    early so a user doesn't blow time on the button dance just to
+    fail mid-flash:
+
+      1. esptool not importable → install (after y/n prompt).
+      2. esptool too old (< _MIN_ESPTOOL) → upgrade. flash.py uses
+         ``--after watchdog_reset`` (esptool 4.8+); a 4.7.0 install
+         would silently get past this preflight under the old
+         "importable means OK" check, then fail mid-FLASH with an
+         opaque argparse error.
+      3. Post-install re-verification: after pip runs, we check
+         again that esptool is the right version. Catches the
+         Ubuntu 22.04 trap where a too-old pip silently resolves
+         back to 4.7.0 because it can't fetch newer sdists.
+
+    pyserial is vendored under ``scripts/vendor/`` (BSD-3-Clause);
+    esptool is GPLv2+ and pip-installed on first run.
+    """
+    pyserial_ok = _pyserial_present()
+    esp_ver = _esptool_version()
+    esp_ok = esp_ver is not None and esp_ver >= _MIN_ESPTOOL
+
+    # Happy path: everything resolves and is recent enough.
+    if pyserial_ok and esp_ok:
         sys.stderr.write(
-            "Using bundled deps from scripts/vendor/ (pyserial + esptool).\n"
+            "Deps OK: pyserial from scripts/vendor/, "
+            "esptool {} from user/system site-packages.\n".format(
+                _esptool_version_str()
+            )
         )
         return
 
+    # Build a human-readable list of what's missing or stale, plus
+    # the matching pip-install spec list (for the manual-install
+    # hint when we can't prompt).
     missing: list[str] = []
-    if not _pyserial_present():
-        missing.append("pyserial")
-    if not _esptool_present():
-        missing.append("esptool")
-    if not missing:
-        return
+    install_spec: list[str] = []
+    if not pyserial_ok:
+        missing.append("pyserial (not importable)")
+        install_spec.append("pyserial")
+    if esp_ver is None:
+        missing.append("esptool (not importable)")
+        install_spec.append("esptool>={}.{}".format(*_MIN_ESPTOOL))
+    elif not esp_ok:
+        missing.append(
+            "esptool {} (need >= {}.{})".format(
+                _esptool_version_str(), *_MIN_ESPTOOL
+            )
+        )
+        install_spec.append("esptool>={}.{}".format(*_MIN_ESPTOOL))
 
-    sys.stderr.write(
-        "Missing Python dependencies: {}\n".format(", ".join(missing))
-    )
+    sys.stderr.write("Missing or stale Python dependencies:\n")
+    for m in missing:
+        sys.stderr.write("  - {}\n".format(m))
+
+    # Inside a venv, ``--user`` would install outside the venv and
+    # wouldn't be importable by this process.
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+    # Prefer ``-r requirements.txt`` so the repo's version pins flow
+    # through. Fall back to per-package specs if the file is missing
+    # (someone trimmed the repo).
+    req = _requirements_path()
+    cmd_base = [sys.executable, "-m", "pip", "install"]
+    if not in_venv:
+        cmd_base.append("--user")
+    if os.path.isfile(req):
+        cmd = cmd_base + ["-r", req]
+        why = "via {}".format(req)
+    else:
+        cmd = cmd_base + install_spec
+        why = "as fallback (requirements.txt missing)"
 
     # Non-interactive callers (CI, scripts redirecting stdin) shouldn't
     # hang on input(). Bail with a clear manual-install hint instead.
     if not sys.stdin.isatty():
         sys.stderr.write(
             "stdin is not a tty; can't prompt interactively. Install with:\n"
-            "  {} -m pip install --user {}\n".format(
-                sys.executable, " ".join(missing)
-            )
+            "  {}\n".format(" ".join(cmd))
         )
         sys.exit(2)
 
-    prompt = "Install {} now with pip? [Y/n] ".format(", ".join(missing))
+    prompt = "Install/upgrade now with pip ({})? [Y/n] ".format(why)
     try:
         answer = input(prompt).strip().lower()
     except EOFError:
@@ -595,21 +829,10 @@ def _preflight() -> None:
         sys.exit(2)
     if answer in ("n", "no"):
         sys.stderr.write(
-            "Aborted. Install manually and re-run:\n"
-            "  {} -m pip install --user {}\n".format(
-                sys.executable, " ".join(missing)
-            )
+            "Aborted. Install manually and re-run:\n  {}\n".format(" ".join(cmd))
         )
         sys.exit(2)
 
-    # Inside a venv, `--user` would install outside the venv and wouldn't
-    # be importable by this process. Skip the flag there. (PEP 405: in a
-    # venv, sys.prefix diverges from sys.base_prefix.)
-    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
-    cmd = [sys.executable, "-m", "pip", "install"]
-    if not in_venv:
-        cmd.append("--user")
-    cmd.extend(missing)
     sys.stderr.write("Running: {}\n".format(" ".join(cmd)))
     try:
         subprocess.check_call(cmd)
@@ -620,6 +843,44 @@ def _preflight() -> None:
             )
         )
         sys.exit(2)
+
+    # Post-install re-verification. importlib caches negative results
+    # for the lifetime of the interpreter, so we have to invalidate
+    # before retrying find_spec / re-importing esptool.
+    importlib.invalidate_caches()
+    try:
+        # Drop any cached esptool module so the next import sees the
+        # newly-installed copy. Safe even if esptool was never
+        # imported in this process.
+        sys.modules.pop("esptool", None)
+    except Exception:
+        pass
+
+    if not _pyserial_present():
+        sys.stderr.write(
+            "After pip install, pyserial is still not importable. "
+            "Something is wrong with your Python environment.\n"
+        )
+        sys.exit(2)
+    new_ver = _esptool_version()
+    if new_ver is None or new_ver < _MIN_ESPTOOL:
+        sys.stderr.write(
+            "After pip install, esptool is {} but we need >= {}.{}.\n"
+            "This usually means your pip is too old to fetch newer\n"
+            "esptool releases (Ubuntu 22.04 ships a pip with this bug).\n"
+            "Try upgrading pip first:\n"
+            "  {} -m pip install --user --upgrade pip\n"
+            "then re-run this command.\n".format(
+                _esptool_version_str(),
+                _MIN_ESPTOOL[0],
+                _MIN_ESPTOOL[1],
+                sys.executable,
+            )
+        )
+        sys.exit(2)
+    sys.stderr.write(
+        "Deps installed: esptool {}.\n".format(_esptool_version_str())
+    )
 
     # pip wrote new files into site-packages / user scripts dir. Clear
     # the import system's finder cache so the re-check picks them up
@@ -740,6 +1001,11 @@ def main() -> int:
     banner("DETECT")
     with Heartbeat("DETECT"):
         port = detect.pick_port(args.port)
+        # Surface dialout/group permission issues now, before the
+        # esptool probe (which would fail with a less-specific
+        # PermissionError) and well before the user invests time in
+        # the button dance.
+        _check_port_access(port)
         native = _is_native_usb(port)
         if native:
             # Skip esptool probe on native USB: the DTR/RTS reset it uses to
@@ -915,6 +1181,11 @@ def main() -> int:
         sys.stderr.write(
             "Device is flashed and the app bundle is installed. Unplug, "
             "power on, and it should boot straight into the launcher.\n"
+            "\n"
+            "To connect from Claude Desktop:\n"
+            "  1. Help menu → Troubleshooting → Enable Developer Tools\n"
+            "  2. Developer menu → launch Hardware Buddy\n"
+            "Then pick 'Claude Buddy' from the device launcher and Connect.\n"
         )
     else:
         sys.stderr.write(

@@ -44,6 +44,10 @@ Done. Power the device on/off with the side switch.
 3. In Claude Desktop: **Help → Troubleshooting → Enable Developer Tools** (one-time, persists)
 4. Then **Developer menu → Hardware Buddy → Connect**
 
+## Event WiFi
+
+The bundled launcher auto-connects to the event WiFi (`cardputer` / `cardconnect`) on every boot and displays the result on screen — `Connected · IP: 192.168.x.x` on success, `WiFi: offline` on failure (the launcher always continues either way). The credentials are intentionally checked into [`buddy/device/wifi_event.py`](buddy/device/wifi_event.py); the AP is publicly broadcast at the venue and the password is the published handout, so this is not a leaked secret. To use this bundle outside the event, edit `wifi_event.py` (replace `SSID`/`PASSWORD`) or remove the `_connect_wifi_with_splash()` call near the top of `main()` to disable the auto-connect entirely.
+
 ## Adding your own app
 
 1. Drop a `.py` file into `buddy/device/apps/`

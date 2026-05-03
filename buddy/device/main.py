@@ -66,11 +66,28 @@ except ImportError as e:
     _burst = None
 
 
+# Event-WiFi auto-connect lives in a peer module so the credentials
+# (which are intentionally checked into the public repo for the
+# event bundle) are easy to find and replace post-event.
+try:
+    import wifi_event as _wifi
+except ImportError as e:
+    print("launcher: wifi_event not available:", e)
+    _wifi = None
+
+
 _BLACK = 0x000000
 _ORANGE = 0xCC785C
 _CREAM = 0xF0EEE6
 _DARK = 0x1F1F1F
 _GRAY_MID = 0x777777
+_GREEN = 0x00FF00
+_RED = 0xFF0000
+
+# Last-known WiFi connect result, populated by _connect_wifi_with_splash
+# and read by _draw_chrome to render the header status pip. None until
+# the first connect attempt has run.
+_wifi_status = None
 
 _LCD = M5.Lcd
 _W = 240
@@ -95,6 +112,74 @@ def _set_font():
     except Exception as e:
         # Build without FONTS; fall back to default. Not fatal.
         print("launcher: setFont fallback:", e)
+
+
+def _connect_wifi_with_splash():
+    """Show a Connecting splash, run the event-WiFi connect, then
+    flash a Connected/Failed result for ~1.5 s before returning.
+
+    Stores the result in module-level ``_wifi_status`` so the
+    launcher chrome can render the right status pip on every
+    repaint. Safe to call when ``wifi_event`` failed to import —
+    we just skip the splash entirely and the chrome shows the
+    "OFFLINE" pip.
+    """
+    global _wifi_status
+    if _wifi is None:
+        return
+    _LCD.fillScreen(_BLACK)
+    _LCD.setTextSize(1)
+    _LCD.setTextColor(_ORANGE, _BLACK)
+    title = "Connecting to WiFi"
+    _LCD.drawString(title, (_W - _LCD.textWidth(title)) // 2, 40)
+    _LCD.setTextColor(_GRAY_MID, _BLACK)
+    sub = "SSID: {}".format(_wifi.SSID)
+    _LCD.drawString(sub, (_W - _LCD.textWidth(sub)) // 2, 60)
+    _LCD.drawString("(up to 8s)", (_W - _LCD.textWidth("(up to 8s)")) // 2, 78)
+
+    try:
+        result = _wifi.connect()
+    except Exception as e:
+        # Defensive — wifi_event imports network at call time, and a
+        # build without a working network module would explode here.
+        # The launcher should still come up.
+        result = {"ok": False, "ssid": getattr(_wifi, "SSID", "?"),
+                  "err": "exception: {}".format(e), "elapsed_ms": 0}
+    _wifi_status = result
+
+    _LCD.fillScreen(_BLACK)
+    _LCD.setTextSize(1)
+    if result.get("ok"):
+        _LCD.setTextColor(_GREEN, _BLACK)
+        head = "Connected"
+        _LCD.drawString(head, (_W - _LCD.textWidth(head)) // 2, 36)
+        _LCD.setTextColor(_CREAM, _BLACK)
+        ip_line = "IP: {}".format(result.get("ip", "?"))
+        _LCD.drawString(ip_line, (_W - _LCD.textWidth(ip_line)) // 2, 60)
+        _LCD.setTextColor(_GRAY_MID, _BLACK)
+        ssid_line = "on {}".format(result.get("ssid", "?"))
+        _LCD.drawString(ssid_line, (_W - _LCD.textWidth(ssid_line)) // 2, 80)
+    else:
+        _LCD.setTextColor(_RED, _BLACK)
+        head = "WiFi: offline"
+        _LCD.drawString(head, (_W - _LCD.textWidth(head)) // 2, 36)
+        _LCD.setTextColor(_GRAY_MID, _BLACK)
+        err = (result.get("err") or "")[:30]
+        _LCD.drawString(err, (_W - _LCD.textWidth(err)) // 2, 60)
+        note = "launcher continues anyway"
+        _LCD.drawString(note, (_W - _LCD.textWidth(note)) // 2, 80)
+
+    time.sleep_ms(1500)
+
+
+def _wifi_pip_label():
+    """Header-strip text + color for the current WiFi state. Returns
+    ``(text, color)``. Colors are picked to read cleanly against the
+    DARK header background.
+    """
+    if _wifi_status is None or not _wifi_status.get("ok"):
+        return ("OFFLINE", _GRAY_MID)
+    return ("ONLINE", _GREEN)
 
 
 def _discover_apps():
@@ -178,6 +263,12 @@ def _draw_chrome(apps, cursor):
     _LCD.setTextSize(1)
     _LCD.setTextColor(_ORANGE, _DARK)
     _LCD.drawString("Claude Buddy Launcher", 6, 5)
+
+    # WiFi status pip on the header's right side. Reads the cached
+    # _wifi_status set by _connect_wifi_with_splash on boot.
+    pip_text, pip_color = _wifi_pip_label()
+    _LCD.setTextColor(pip_color, _DARK)
+    _LCD.drawString(pip_text, _W - _LCD.textWidth(pip_text) - 6, 5)
 
     # Menu rows constrained to the left region so the burst animation
     # has clean space on the right. Up to 6 visible; more than that
@@ -296,6 +387,13 @@ def _launch(mod_name):
 
 def main():
     _set_font()
+    # Connect to the event WiFi BEFORE the launcher menu so the user
+    # sees the connect status as part of boot rather than a sudden
+    # screen swap mid-menu. Splash takes ~3-9 s in the success case
+    # (connect + 1.5 s status flash) and at most ~9.5 s on failure
+    # (8 s timeout + 1.5 s flash). Long but explicit.
+    _connect_wifi_with_splash()
+
     apps = _discover_apps()
     if not apps:
         _LCD.fillScreen(_BLACK)

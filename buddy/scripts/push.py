@@ -48,6 +48,7 @@ DEFAULT_FILES = [
     "buddy_chars.py",
     "buddy_protocol.py",
     "burst_frames.py",
+    "wifi_event.py",
     "apps/claude_buddy.py",
     "apps/hello_cardputer.py",
     "apps/snake.py",

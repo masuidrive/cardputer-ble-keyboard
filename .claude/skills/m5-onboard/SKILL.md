@@ -17,13 +17,6 @@ git clone <m5stack repo>             # anywhere — clone location doesn't matte
 
 The `buddy/` sibling directory ships in the same repo, so `--apps buddy` works out of the box after a single clone — the skill resolves the bundle relative to its own install location (via `os.path.realpath(__file__)`), so the repo can live anywhere on disk. `~/Downloads/m5stack/buddy/device` and `~/Desktop/m5stack/buddy/device` are checked as conventional fallbacks if the script-relative path doesn't pan out. Set `M5_BUDDY_DIR` only if you want to point at a different bundle than the one bundled with this clone — see the Platform notes section.
 
-### Legacy install (manual symlink under `~/.claude/skills/`)
-
-If you'd rather have the skill discoverable globally without registering the repo as a plugin, you can still place a symlink (or junction on Windows) at `~/.claude/skills/m5-onboard/` pointing at `<repo>/.claude/skills/m5-onboard/`. The scripts use `os.path.realpath(__file__)` and walk up four levels, so the symlink resolves back to the real clone and `--apps buddy` still finds the bundle.
-
-- macOS / Linux: `ln -s "$(pwd)/<repo-dir>/.claude/skills/m5-onboard" ~/.claude/skills/m5-onboard`
-- Windows (PowerShell): `cmd /c mklink /J "$HOME\.claude\skills\m5-onboard" "<full-path-to-repo>\.claude\skills\m5-onboard"`
-
 ## When to use
 
 Use this when a user plugs in an M5Stack device and wants it provisioned. The decision tree:
@@ -186,7 +179,7 @@ The skill runs on macOS, Linux, and Windows. Non-obvious bits:
 - **Windows Store Python.** Newer Windows 11 machines may have Python pre-installed via Microsoft Store. It works but has quirky PATH behavior (lives under `%LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.*\`). `detect.py` checks that location too. If you have the choice, the `winget install Python.Python.3.13` version is more predictable.
 - **Bundle path resolution.** `install_apps.py`'s `--src buddy` shorthand resolves in this order:
   1. `$M5_BUDDY_DIR` if set — explicit override, always wins. Useful when you want to point at a fork or a customized bundle that isn't in this clone.
-  2. The `buddy/device/` directory inside this repo, found via `os.path.realpath(__file__)` walking up from `install_apps.py`. Works for any clone location, including symlinked skill installs at `~/.claude/skills/m5-onboard/`.
+  2. The `buddy/device/` directory inside this repo, found via `os.path.realpath(__file__)` walking up from `install_apps.py`. Works for any clone location.
   3. `~/Downloads/m5stack/buddy/device`.
   4. `~/Desktop/m5stack/buddy/device`.
 

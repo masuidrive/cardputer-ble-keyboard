@@ -1,122 +1,131 @@
-# m5stack
+# Cardputer BLE Keyboard
 
-Flash a Cardputer-Adv and install the Claude Buddy apps in one command.
+Turn an [M5Stack Cardputer-Adv](https://docs.m5stack.com/en/core/Cardputer-Adv)
+into a real Bluetooth Low Energy keyboard for macOS, Android, and any other
+host that speaks HID-over-GATT. Pair it once and type into anything — no
+companion app, no dongle.
 
-## Quick start
+The keyboard ships as **Arduino firmware** (`buddy/firmware/cardputer_ble_kb/`).
+It enumerates as a standard BLE HID keyboard with battery reporting, full
+modifier support (including ⌘ Command on macOS), and an Fn layer for the
+arrow keys.
 
-1. Clone this repo locally — anywhere is fine:
-   ```bash
-   git clone <repo-url>
-   ```
-   The skill auto-detects the buddy bundle relative to its own install location, so the clone path doesn't matter. `~/Downloads/m5stack/` and `~/Desktop/m5stack/` are also checked as conventional fallbacks.
-2. Plug the Cardputer into your laptop via USB-C
-3. Open Claude Code and start a new chat
-4. Point Claude Code to the repo folder
-5. Type `m5-onboard go`
-
-That's it — Claude will automatically flash the firmware and push the apps onto the device.
-
-### When Claude prompts you to put the device into download mode
-
-Halfway through, Claude will pause and ask you to do this on the **back** of the device:
-
-1. Hold down the **G0** button on the Cardputer
-2. While still holding G0, press the **Reset** button
-3. Release Reset first, then release G0
-4. The screen goes dark — device is in download mode
-
-Claude takes over from there.
-
-### What happens next
-
-- **Firmware writes to the device** (~180 seconds)
-- **Apps push to the device** (~100 seconds)
-- **Device reboots** straight into the launcher — pick an app and go
-
-Done. Power the device on/off with the side switch.
+> **Built — and editable — by talking to Claude.** This whole project was
+> developed in conversation with [Claude Code](https://claude.com/claude-code):
+> the firmware, the key mappings, the BLE pairing fixes, all of it. You don't
+> need to read C++ to change how it behaves. Open this repo in Claude Code and
+> just say what you want — *"swap Option and Command", "add an Fn+L lock
+> screen shortcut", "make the backlight dimmer"* — and Claude edits the
+> firmware, rebuilds, and flashes it to the device for you.
 
 ---
 
-## Using Claude Buddy (BLE)
+## What works
 
-1. Power on the Cardputer
-2. Pick **Claude Buddy** from the launcher menu
-3. In Claude Desktop: **Help → Troubleshooting → Enable Developer Tools** (one-time, persists)
-4. Then **Developer menu → Hardware Buddy → Connect**
-
-## Event WiFi
-
-The bundled launcher auto-connects to the event WiFi (`cardputer` / `cardconnect`) on every boot and displays the result on screen — `Connected · IP: 192.168.x.x` on success, `WiFi: offline` on failure (the launcher always continues either way). The credentials are intentionally checked into [`buddy/device/wifi_event.py`](buddy/device/wifi_event.py); the AP is publicly broadcast at the venue and the password is the published handout, so this is not a leaked secret. To use this bundle outside the event, edit `wifi_event.py` (replace `SSID`/`PASSWORD`) or remove the `_connect_wifi_with_splash()` call near the top of `main()` to disable the auto-connect entirely.
-
-## Adding your own app
-
-1. Drop a `.py` file into `buddy/device/apps/`
-2. Push just the apps without re-flashing:
-   ```bash
-   python3 .claude/skills/m5-onboard/scripts/install_apps.py --port <PORT> --src buddy
-   ```
-3. The launcher auto-discovers the new app on next boot
-
-Crib from `buddy/device/apps/hello_cardputer.py` — it's the smallest example of the conventions (keyboard polling, font, exit behaviour).
-
-## Getting back to stock UIFlow
-
-The buddy bundle takes over the boot flow via `/flash/main.py`. Remove
-that file and UIFlow's stock launcher boots normally on the next reset.
-From the device REPL:
-
-```python
-import os
-os.remove('/flash/main.py')
-import machine; machine.reset()
-```
-
-To also drop the apps under `/flash/apps/`, walk that directory the
-same way and remove what you don't want.
-
-If you want a fresh UIFlow firmware on top, re-run `m5-onboard go`
-_without_ `--apps`: the skill flashes UIFlow and stops, leaving the
-filesystem alone. The previous `boot_uiflow.py`-rename procedure here
-referred to a backup that `install_apps.py` only creates when the
-bundle ships its own root `boot.py`; the buddy bundle doesn't, so
-that backup never exists for these users.
+- **Pairs and types** on macOS and Android over BLE (Just-Works pairing, no PIN).
+- **Bonding persists** across reboots — power-cycle the Cardputer and it
+  reconnects to the last host without re-pairing.
+- **Real battery level** reported to the host (updated every ~3 minutes).
+- **Modifiers**, mapped with macOS semantics:
+  | Cardputer key | Sends |
+  |---|---|
+  | `ctrl`  | Left Control |
+  | `shift` | Left Shift |
+  | `opt`   | Left Alt (= Option ⌥) |
+  | `alt`   | Left GUI (= Command ⌘) |
+- **Fn layer** (Fn is not a HID key; the firmware remaps while it's held):
+  | Chord | Sends |
+  |---|---|
+  | `Fn` + `;` `,` `.` `/` | ↑ ← ↓ → arrows |
+  | `Fn` + `` ` `` | Escape |
+  | `Fn` + `Backspace` | Forward Delete |
 
 ---
 
-## Prerequisites
+## Flashing it
 
-You need **Python 3.10+**, **git**, and **Claude Code** on your laptop. `pyserial` ships vendored inside `.claude/skills/m5-onboard/scripts/vendor/`. `esptool` is GPL-licensed and is **not** vendored — the skill auto-installs it via pip on first run if it isn't already in your environment, so the user-facing experience is still a single command. To pre-install explicitly: `python3 -m pip install --user -r requirements.txt`.
-
-Bootstrap if needed:
-
-- **macOS** — `python3` usually pre-installed; if not, `brew install python`
-- **Linux (Debian/Ubuntu)** — `sudo apt-get install -y python3 python3-pip git`
-- **Windows** — `winget install -e --id Python.Python.3.13` and `winget install -e --id Git.Git`
-
-**Windows + older boards only:** the CH9102 USB-UART driver is needed for Basic / Fire / Core2 / StickC. Download from [WCH](https://www.wch.cn/downloads/CH343SER_EXE.html). Cardputer-Adv and CoreS3 use the in-box composite-USB driver and need nothing extra.
-
-**Want `--apps buddy` to point at a different bundle?** The default resolves to the `buddy/device/` directory next to the skill in this repo, with `~/Downloads/m5stack/` and `~/Desktop/m5stack/` checked as fallbacks. To override (e.g. you maintain a fork or have a customized bundle elsewhere), set `M5_BUDDY_DIR`:
+You need [PlatformIO](https://platformio.org/) (`pip install platformio`).
 
 ```bash
-export M5_BUDDY_DIR=/path/to/buddy/device
+cd buddy/firmware/cardputer_ble_kb
+pio run                                    # build
+pio run -t upload --upload-port <PORT>     # flash
 ```
 
-## Troubleshooting
+`<PORT>` is the Cardputer's USB serial port (`/dev/cu.usbmodem*` on macOS,
+`/dev/ttyACM*` on Linux, `COMx` on Windows).
 
-- **Download-mode prompt keeps retrying** — you're releasing G0 too early. Release Reset first, keep holding G0 for about a second, then release.
-- **"No USB-UART bridge found" (older boards)** — install the CH9102 driver on Windows; on macOS/Linux, unplug and replug.
-- **Claude Buddy never connects over BLE** — make sure the buddy launcher (not UIFlow's) owns `/flash/main.py`. The skill handles this automatically on install.
-- **Something else feels broken** — run `python3 .claude/skills/m5-onboard/scripts/smoke_test.py --port <PORT>` for an I2C + LCD + speaker + button check.
+**First flash from stock UIFlow firmware** needs the device in download mode.
+On the **back** of the Cardputer-Adv: hold **BtnG0**, tap **BtnRST**, release
+BtnRST first, then release BtnG0 — the screen goes dark. After that, uploads
+auto-reset (no button dance) because the firmware ships USB-CDC-on-boot.
 
-## What's in this repo
+…or just open the repo in Claude Code and say *"flash the keyboard firmware"* —
+it handles the build, the port, and the download-mode coaching.
 
-- **`.claude/skills/m5-onboard/`** — the Claude Code skill. Detect port, flash UIFlow, install apps. See [`.claude/skills/m5-onboard/SKILL.md`](.claude/skills/m5-onboard/SKILL.md) for the full playbook and every gotcha baked into the scripts.
-- **`buddy/`** — the MicroPython app bundle that gets installed. See [`buddy/README.md`](buddy/README.md) for device-side layout and iteration tooling.
+### Pairing
 
-The two are decoupled by design: the `m5-onboard` skill can install any bundle via `--apps <path>`; `buddy` is just what ships here.
+1. On the host, open Bluetooth settings and connect to **`Cardputer KB`**.
+2. No PIN dialog appears — that's correct for a Just-Works HID keyboard.
+3. Type into any text field.
+
+If the host had paired with an earlier build, **forget the device** in its
+Bluetooth settings once and reconnect (the GATT layout changed; hosts cache it).
+
+---
+
+## Why two implementations live here
+
+`buddy/device/apps/ble_keyboard.py` is a **MicroPython version** that runs on
+the stock UIFlow 2.0 firmware. It is kept for the record because it does *not*
+work as a daily-driver keyboard, and the reason is interesting:
+
+UIFlow 2.0's MicroPython BLE stack can advertise an HID profile and start
+pairing, but its **SMP (pairing) layer never completes encryption** — every
+attempt ends in `ENCRYPTION_UPDATE enc=0` against macOS, iOS, and Android
+alike. The Arduino path fails the same way on the **Bluedroid** stack with a
+telltale `smp_derive_link_key_from_long_term_key failed / sm4=0x00`: that's
+Bluedroid trying *Cross-Transport Key Derivation* (deriving a Classic-Bluetooth
+link key from the BLE LTK) on a chip — the ESP32-S3 — that has **no Classic
+radio**, made worse by the common library default of requiring MITM on a
+keyboard with no input/output capability.
+
+The fix, and the reason the shipping firmware works, is to use the **NimBLE**
+host stack with **Just-Works** security (bonding + Secure Connections, no
+MITM, IO capability "none"). NimBLE performs no cross-transport derivation, so
+pairing completes cleanly. The full experiment log lives in the docstring of
+`ble_keyboard.py` if you want the play-by-play.
+
+---
+
+## Roadmap
+
+- **Multi-host switching** (`Fn`+`1` / `Fn`+`2` to jump between, say, a Mac and
+  a phone) — the design is researched: one BLE identity per slot, separate
+  bond storage per slot, switch-and-reconnect. Not implemented yet.
+
+(Want one of these? Ask Claude Code in this repo to build it.)
+
+---
+
+## This repo also contains the M5Stack provisioning skill
+
+Before the BLE keyboard, this repo was a one-command provisioner that flashes a
+Cardputer-Adv with UIFlow and installs the "Claude Buddy" MicroPython app
+bundle. That tooling is still here and still works — the `m5-onboard` Claude
+Code skill under `.claude/skills/`, the app bundle under `buddy/device/`, and
+its original documentation in **[`README.orig.md`](README.orig.md)**.
+
+Running `m5-onboard go` reflashes UIFlow and the buddy bundle, which is also
+exactly how you **revert** a device from this BLE-keyboard firmware back to a
+normal Cardputer. The flash is fully reversible.
+
+---
 
 ## License
 
-This project's own code is licensed under **Apache 2.0** — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
-
-`pyserial` (BSD-3-Clause, Apache-compatible) is the only third-party package bundled in `.claude/skills/m5-onboard/scripts/vendor/`. `esptool` (GPLv2+) is intentionally not vendored; it's declared as a pip dependency in [`requirements.txt`](requirements.txt) so the repository itself stays cleanly Apache-2.0. See [`LICENSE-THIRD-PARTY.md`](LICENSE-THIRD-PARTY.md) for details.
+Apache 2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). Third-party
+components are listed in [`LICENSE-THIRD-PARTY.md`](LICENSE-THIRD-PARTY.md). The
+Arduino firmware additionally pulls in `M5Cardputer`, `NimBLE-Arduino`, and the
+`ESP32-BLE-Keyboard` library at build time via PlatformIO; those carry their
+own licenses.

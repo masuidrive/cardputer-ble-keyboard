@@ -440,8 +440,57 @@ def _launch(mod_name):
     # return here — we reboot back to main.py from the reset.
 
 
+def _autostart_app():
+    """Return the module name configured for direct boot, or None.
+
+    An optional ``/flash/autostart.py`` (``APP = "ble_keyboard"``)
+    makes a power-on boot skip the menu (and the WiFi splash — the
+    apps people autostart don't need it and it costs 3-9 s) and land
+    straight in the named app. The escape hatch is the apps' own
+    exit protocol: every bundle app exits via ``machine.reset()``.
+    On this build that reports as HARD_RESET (2), NOT SOFT_RESET —
+    measured on-device; esp_restart() maps to ESP_RST_SW which this
+    port surfaces as HARD_RESET. So the only cause we autostart on
+    is PWRON_RESET: flip the power switch → app; exit gesture out
+    of it → menu, as before.
+
+    The bundle doesn't ship ``autostart.py`` — it's a per-device
+    opt-in pushed manually, so freshly provisioned devices keep the
+    stock menu-first behavior.
+    """
+    try:
+        import autostart
+    except ImportError:
+        return None
+    app = getattr(autostart, "APP", None)
+    if not app:
+        return None
+    try:
+        cause = machine.reset_cause()
+    except Exception as e:
+        print("launcher: reset_cause unavailable:", e)
+        return None
+    if cause != machine.PWRON_RESET:
+        print("launcher: reset cause", cause, "— skipping autostart, showing menu")
+        return None
+    return app
+
+
 def main():
     _set_font()
+    app = _autostart_app()
+    if app is not None:
+        print("launcher: autostart ->", app)
+        # Cold-boot settle BEFORE the app constructs MatrixKeyboard.
+        # From the menu path this time has long passed by the time an
+        # app starts; on the direct path we have to provide it, or
+        # the app's keyboard is permanently dead (see the comment on
+        # the 800 ms sleep below).
+        time.sleep_ms(800)
+        _launch(app)
+        # _launch only returns on a crashed import — fall through to
+        # the normal menu flow so the device stays usable.
+
     # Bring up NimBLE BEFORE connecting to WiFi. ESP32's 2.4 GHz
     # radio is shared between WiFi and BLE through a software
     # coexistence arbiter; ESP-IDF documents that controllers

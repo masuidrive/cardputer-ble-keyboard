@@ -199,6 +199,15 @@ static void drawGuide() {
     snprintf(hdr, sizeof(hdr), "Fn  Host %d", currentSlot + 1);
     d.drawString(hdr, 6, 4);
 
+    // Battery, top-right.
+    int32_t batt = M5.Power.getBatteryLevel();
+    char bat[8];
+    if (batt >= 0) snprintf(bat, sizeof(bat), "%ld%%", (long)batt);
+    else           snprintf(bat, sizeof(bat), "--");
+    d.setTextSize(2);
+    d.setTextColor(batt >= 0 && batt <= 20 ? COL_ORANGE : COL_CREAM, COL_DARK);
+    d.drawString(bat, d.width() - d.textWidth(bat) - 6, 4);
+
     d.setTextSize(2);
     d.setTextColor(COL_CREAM, COL_BLACK);
     d.drawString("1/2/3 = host",  6, 34);

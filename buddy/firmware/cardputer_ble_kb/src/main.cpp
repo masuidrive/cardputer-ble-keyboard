@@ -21,9 +21,10 @@
 //   Fn + 1 / 2 / 3-> switch host slot (multi-device, below)
 //   Fn + 0        -> unpair the current host slot
 //
-// Holding Fn shows an on-screen guide of the useful chords (host
-// switch / IME / unpair). The display is otherwise off while typing
-// to save power, waking only on a Fn hold or a connect/disconnect.
+// The display stays on continuously, showing a status screen;
+// holding Fn overrides it with a guide of the useful chords (host
+// switch / IME / unpair / brightness). Brightness is Fn+[ / Fn+]
+// adjustable and saved to NVS.
 //
 // Multi-host: three independent host "slots." Each slot advertises
 // under its own BLE address (factory MAC with the low nibble set to
@@ -45,9 +46,15 @@
 #include "esp_mac.h"
 
 static const uint8_t NUM_SLOTS = 3;
-static const uint8_t DISP_ON = 180;           // backlight brightness when awake
-static const uint32_t SHOW_CONNECTED_MS = 8000;   // status dwell after connect
-static const uint32_t SHOW_ADVERTISING_MS = 30000; // longer while waiting to pair
+
+// Backlight brightness when awake — adjustable with Fn+[ / Fn+] and
+// persisted to NVS. Min stays above 0 so the screen never adjusts
+// itself fully dark.
+static const uint8_t BRIGHT_DEFAULT = 26;     // ~10% of 255
+static uint8_t dispBright = BRIGHT_DEFAULT;
+static const uint8_t BRIGHT_MIN = 16;
+static const uint8_t BRIGHT_MAX = 255;
+static const uint8_t BRIGHT_STEP = 32;
 
 // Constructed in setup() once the active slot is known, so the GAP
 // name can carry the slot number.
@@ -80,8 +87,22 @@ static uint8_t fnRemap(uint8_t usage) {
 // switch / unpair) and must NOT be typed to the host.
 static bool isFnCommandKey(uint8_t usage) {
     if (usage >= 0x1E && usage < 0x1E + NUM_SLOTS) return true;  // 1..NUM_SLOTS
-    if (usage == 0x27) return true;                              // 0
+    if (usage == 0x27) return true;                              // 0  unpair
+    if (usage == 0x2F || usage == 0x30) return true;            // [ ] brightness
     return false;
+}
+
+// Step the backlight brightness and persist it. Applied live so the
+// change is visible while the Fn guide is on screen.
+static void adjustBrightness(int delta) {
+    int v = (int)dispBright + delta;
+    if (v < BRIGHT_MIN) v = BRIGHT_MIN;
+    if (v > BRIGHT_MAX) v = BRIGHT_MAX;
+    dispBright = (uint8_t)v;
+    M5Cardputer.Display.setBrightness(dispBright);
+    prefs.begin("kbd", false);
+    prefs.putUChar("bright", dispBright);
+    prefs.end();
 }
 
 static void addKey(KeyReport &report, int &n, uint8_t usage) {
@@ -147,44 +168,41 @@ static void drawStatus(bool connected) {
     auto &d = M5Cardputer.Display;
     d.fillScreen(COL_BLACK);
 
-    // Header bar.
+    // Header bar: title + battery top-right.
     d.fillRect(0, 0, d.width(), 24, COL_DARK);
     d.fillRect(0, 24, d.width(), 1, COL_ORANGE);
     d.setTextSize(2);
     d.setTextColor(COL_ORANGE, COL_DARK);
     d.drawString("BLE Keyboard", 6, 4);
 
-    // Big connection state.
+    int32_t batt = M5.Power.getBatteryLevel();
+    char bat[8];
+    if (batt >= 0) snprintf(bat, sizeof(bat), "%ld%%", (long)batt);
+    else           snprintf(bat, sizeof(bat), "--");
+    d.setTextColor(batt >= 0 && batt <= 20 ? COL_ORANGE : COL_CREAM, COL_DARK);
+    d.drawString(bat, d.width() - d.textWidth(bat) - 6, 4);
+
+    // The headline: which host slot is active.
+    char host[12];
+    snprintf(host, sizeof(host), "Host %d", currentSlot + 1);
+    d.setTextSize(3);
+    d.setTextColor(COL_CREAM, COL_BLACK);
+    d.drawString(host, (d.width() - d.textWidth(host)) / 2, 34);
+
+    // Connection state, colored.
     const char *msg = connected ? "CONNECTED" : "ADVERTISING";
     d.setTextSize(2);
-    d.setTextColor(connected ? COL_GREEN : COL_CREAM, COL_BLACK);
-    d.drawString(msg, (d.width() - d.textWidth(msg)) / 2, 32);
+    d.setTextColor(connected ? COL_GREEN : COL_ORANGE, COL_BLACK);
+    d.drawString(msg, (d.width() - d.textWidth(msg)) / 2, 68);
 
-    // Detail lines.
+    // Device name + hint, small.
+    char name[20];
+    slotName(currentSlot, name, sizeof(name));
     d.setTextSize(1);
     d.setTextColor(COL_CREAM, COL_BLACK);
-    char buf[40], name[20];
-    slotName(currentSlot, name, sizeof(name));
-    snprintf(buf, sizeof(buf), "Host %d   %s", currentSlot + 1, name);
-    d.drawString(buf, 6, 56);
-
-    d.setTextColor(COL_GRAY, COL_BLACK);
-    snprintf(buf, sizeof(buf), "Addr %s",
-             NimBLEDevice::getAddress().toString().c_str());
-    d.drawString(buf, 6, 68);
-
-    int32_t batt = M5.Power.getBatteryLevel();
-    int bonds = NimBLEDevice::getNumBonds();
-    if (batt >= 0)
-        snprintf(buf, sizeof(buf), "Battery %ld%%   Paired %d", (long)batt, bonds);
-    else
-        snprintf(buf, sizeof(buf), "Paired %d host(s)", bonds);
-    d.drawString(buf, 6, 80);
-
-    // Footer hints.
-    d.setTextColor(COL_GRAY, COL_BLACK);
-    d.drawString("Hold Fn for shortcuts", 6, 100);
-    d.drawString("Fn+1/2/3 switch host", 6, 112);
+    d.drawString(name, (d.width() - d.textWidth(name)) / 2, 94);
+    d.drawString("Hold Fn for shortcuts",
+                 (d.width() - d.textWidth("Hold Fn for shortcuts")) / 2, 110);
 }
 
 static void drawGuide() {
@@ -210,10 +228,12 @@ static void drawGuide() {
 
     d.setTextSize(2);
     d.setTextColor(COL_CREAM, COL_BLACK);
-    d.drawString("1/2/3 = host",    6, 36);
-    d.drawString("Spc/Ent = EN/JP", 6, 64);
-    d.setTextColor(COL_ORANGE, COL_BLACK);
-    d.drawString("0 = unpair",      6, 92);
+    d.drawString("1/2/3/0=Host/unpair", 6, 40);
+    d.drawString("Spc/Ent = EN/JP",     6, 68);
+
+    char bl[20];
+    snprintf(bl, sizeof(bl), "[ ]=bright %d%%", (int)dispBright * 100 / 255);
+    d.drawString(bl, 6, 96);
 }
 
 // Persist the target slot and reboot into it.
@@ -221,7 +241,7 @@ static void switchToSlot(uint8_t slot) {
     if (slot >= NUM_SLOTS || slot == currentSlot) return;
 
     auto &d = M5Cardputer.Display;
-    d.setBrightness(DISP_ON);
+    d.setBrightness(dispBright);
     d.fillScreen(COL_BLACK);
     d.setTextSize(3);
     d.setTextColor(COL_ORANGE, COL_BLACK);
@@ -244,7 +264,7 @@ static void switchToSlot(uint8_t slot) {
 // advertises clean and a different device can pair to it.
 static void unpairCurrentSlot() {
     auto &d = M5Cardputer.Display;
-    d.setBrightness(DISP_ON);
+    d.setBrightness(dispBright);
     d.fillScreen(COL_BLACK);
     d.setTextSize(2);
     d.setTextColor(COL_ORANGE, COL_BLACK);
@@ -269,10 +289,9 @@ static void unpairCurrentSlot() {
 
 // ---- runtime state ----
 
-enum Disp { D_OFF, D_STATUS, D_GUIDE };
+enum Disp { D_STATUS, D_GUIDE };
 static Disp dispMode = D_STATUS;
 static bool forceRedraw = false;
-static uint32_t statusExpireMs = 0;
 static bool lastConnected = false;
 static uint32_t lastBatteryMs = 0;
 static uint32_t connectedAtMs = 0;
@@ -285,10 +304,20 @@ void setup() {
     M5Cardputer.begin(cfg, true);  // true = init keyboard
     M5Cardputer.Display.setRotation(1);
 
-    prefs.begin("kbd", true);
+    prefs.begin("kbd", false);
     currentSlot = prefs.getUChar("slot", 0);
+    dispBright = prefs.getUChar("bright", BRIGHT_DEFAULT);
+    // One-time adoption of the 10% default on devices that still
+    // hold the previous (brighter) saved value. After this, Fn+[/]
+    // adjustments persist normally.
+    if (prefs.getUChar("bver", 0) < 1) {
+        dispBright = BRIGHT_DEFAULT;
+        prefs.putUChar("bright", dispBright);
+        prefs.putUChar("bver", 1);
+    }
     prefs.end();
     if (currentSlot >= NUM_SLOTS) currentSlot = 0;
+    if (dispBright < BRIGHT_MIN) dispBright = BRIGHT_MIN;
 
     applySlotAddress(currentSlot);  // BEFORE BLE init
 
@@ -311,10 +340,9 @@ void setup() {
     Serial.print(" BLE address: ");
     Serial.println(NimBLEDevice::getAddress().toString().c_str());
 
-    M5Cardputer.Display.setBrightness(DISP_ON);
+    M5Cardputer.Display.setBrightness(dispBright);
     drawStatus(false);
     dispMode = D_STATUS;
-    statusExpireMs = millis() + SHOW_ADVERTISING_MS;
 }
 
 void loop() {
@@ -328,8 +356,7 @@ void loop() {
         lastConnected = connected;
         connectedAtMs = now;
         peerCaptured = false;
-        statusExpireMs = now + (connected ? SHOW_CONNECTED_MS : SHOW_ADVERTISING_MS);
-        forceRedraw = true;
+        forceRedraw = true;  // repaint the status for the new state
     }
 
     // Capture the peer's identity address once the (re)connection has
@@ -351,19 +378,15 @@ void loop() {
     }
     if (!connected) lastBatteryMs = 0;
 
-    // Display power state. Off while typing; the Fn guide overrides;
-    // status shows for a window after connect/disconnect.
-    Disp want = fnHeld ? D_GUIDE : (now < statusExpireMs ? D_STATUS : D_OFF);
+    // Always-on display: status is shown continuously; holding Fn
+    // overrides it with the shortcut guide.
+    Disp want = fnHeld ? D_GUIDE : D_STATUS;
     if (want != dispMode || forceRedraw) {
         dispMode = want;
         forceRedraw = false;
-        if (want == D_OFF) {
-            M5Cardputer.Display.setBrightness(0);
-        } else {
-            M5Cardputer.Display.setBrightness(DISP_ON);
-            if (want == D_GUIDE) drawGuide();
-            else drawStatus(connected);
-        }
+        M5Cardputer.Display.setBrightness(dispBright);
+        if (want == D_GUIDE) drawGuide();
+        else drawStatus(connected);
     }
 
     if (M5Cardputer.Keyboard.isChange()) {
@@ -377,6 +400,8 @@ void loop() {
                 for (auto u : ks.hid_keys) {
                     if (u >= 0x1E && u < 0x1E + NUM_SLOTS) switchToSlot(u - 0x1E);
                     else if (u == 0x27) unpairCurrentSlot();
+                    else if (u == 0x2F) { adjustBrightness(-BRIGHT_STEP); forceRedraw = true; }
+                    else if (u == 0x30) { adjustBrightness(+BRIGHT_STEP); forceRedraw = true; }
                 }
             }
 

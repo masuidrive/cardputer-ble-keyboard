@@ -17,6 +17,8 @@
 //   Fn + ; , . /  -> real arrow keys (Up Left Down Right)
 //   Fn + `        -> Escape
 //   Fn + Backspace-> Forward Delete
+//   Fn + Space    -> LANG1 (0x90, かな — switch to Japanese input)
+//   Fn + Enter    -> LANG2 (0x91, 英数 — switch to alphanumeric)
 //   Fn + 1 / 2 / 3-> switch host slot (multi-device, see below)
 //
 // Multi-host: three independent host "slots." Each slot advertises
@@ -63,8 +65,10 @@ static uint8_t fnRemap(uint8_t usage) {
         case 0x36: return 0x50;  // ,  -> Left arrow
         case 0x37: return 0x51;  // .  -> Down arrow
         case 0x38: return 0x4F;  // /  -> Right arrow
-        case 0x35: return 0x29;  // `  -> Escape
-        case 0x2A: return 0x4C;  // BS -> Forward Delete
+        case 0x35: return 0x29;  // `     -> Escape
+        case 0x2A: return 0x4C;  // BS    -> Forward Delete
+        case 0x2C: return 0x90;  // Space -> LANG1 (かな)
+        case 0x28: return 0x91;  // Enter -> LANG2 (英数)
         default:   return usage;
     }
 }
@@ -97,37 +101,37 @@ static void drawStatus(bool connected) {
     auto &d = M5Cardputer.Display;
     d.fillScreen(COL_BLACK);
 
-    // Header bar.
-    d.fillRect(0, 0, d.width(), 22, COL_DARK);
-    d.fillRect(0, 22, d.width(), 1, COL_ORANGE);
-    d.setTextSize(1);
+    // Header bar with the title at size 2.
+    d.fillRect(0, 0, d.width(), 26, COL_DARK);
+    d.fillRect(0, 26, d.width(), 1, COL_ORANGE);
+    d.setTextSize(2);
     d.setTextColor(COL_ORANGE, COL_DARK);
-    d.drawString("BLE Keyboard", 6, 7);
+    d.drawString("BLE Keyboard", 6, 5);
 
-    // Active host slot, big, top-right of the header line area.
+    // Active host slot, size 2, centered.
     char host[12];
     snprintf(host, sizeof(host), "Host %d", currentSlot + 1);
-    d.setTextSize(1);
-    d.setTextColor(COL_CREAM, COL_DARK);
-    d.drawString(host, d.width() - d.textWidth(host) - 6, 7);
-
-    // Big connection status, centered.
-    const char *msg = connected ? "CONNECTED" : "ADVERTISING";
     d.setTextSize(2);
-    d.setTextColor(connected ? COL_GREEN : COL_CREAM, COL_BLACK);
-    d.drawString(msg, (d.width() - d.textWidth(msg)) / 2, 44);
+    d.setTextColor(COL_CREAM, COL_BLACK);
+    d.drawString(host, (d.width() - d.textWidth(host)) / 2, 36);
 
-    // Slot/device name underneath, small.
+    // Connection status — the biggest element, size 3.
+    const char *msg = connected ? "CONNECTED" : "ADVERTISING";
+    d.setTextSize(3);
+    d.setTextColor(connected ? COL_GREEN : COL_CREAM, COL_BLACK);
+    d.drawString(msg, (d.width() - d.textWidth(msg)) / 2, 62);
+
+    // Slot/device name underneath, size 1.
     char name[20];
     slotName(currentSlot, name, sizeof(name));
     d.setTextSize(1);
     d.setTextColor(COL_GRAY, COL_BLACK);
-    d.drawString(name, (d.width() - d.textWidth(name)) / 2, 74);
+    d.drawString(name, (d.width() - d.textWidth(name)) / 2, 98);
 
-    // Hint strip.
+    // Hint strip, size 1.
     d.setTextColor(COL_GRAY, COL_BLACK);
     const char *hint = "Fn+1/2/3 switch host";
-    d.drawString(hint, (d.width() - d.textWidth(hint)) / 2, d.height() - 14);
+    d.drawString(hint, (d.width() - d.textWidth(hint)) / 2, d.height() - 12);
 }
 
 // Persist the target slot and reboot into it. Reboot (vs live address
@@ -138,15 +142,15 @@ static void switchToSlot(uint8_t slot) {
 
     auto &d = M5Cardputer.Display;
     d.fillScreen(COL_BLACK);
-    d.setTextSize(2);
+    d.setTextSize(3);
     d.setTextColor(COL_ORANGE, COL_BLACK);
     char line[16];
     snprintf(line, sizeof(line), "Host %d", slot + 1);
-    d.drawString(line, (d.width() - d.textWidth(line)) / 2, 44);
-    d.setTextSize(1);
+    d.drawString(line, (d.width() - d.textWidth(line)) / 2, 46);
+    d.setTextSize(2);
     d.setTextColor(COL_GRAY, COL_BLACK);
     const char *sub = "switching...";
-    d.drawString(sub, (d.width() - d.textWidth(sub)) / 2, 74);
+    d.drawString(sub, (d.width() - d.textWidth(sub)) / 2, 80);
 
     prefs.begin("kbd", false);
     prefs.putUChar("slot", slot);
@@ -254,9 +258,11 @@ void loop() {
             // Belt and braces: the dedicated state flags cover keys
             // that some library versions report only as flags, not
             // in hid_keys. addKey dedupes, so double-reporting is
-            // harmless.
-            if (st.enter) addKey(report, n, 0x28);
-            if (st.space) addKey(report, n, 0x2C);
+            // harmless. Fn remaps match fnRemap() above:
+            //   Fn+Enter -> LANG2 (英数), Fn+Space -> LANG1 (かな),
+            //   Fn+Backspace -> Forward Delete.
+            if (st.enter) addKey(report, n, st.fn ? 0x91 : 0x28);
+            if (st.space) addKey(report, n, st.fn ? 0x90 : 0x2C);
             if (st.tab)   addKey(report, n, 0x2B);
             if (st.del)   addKey(report, n, st.fn ? 0x4C : 0x2A);
         }

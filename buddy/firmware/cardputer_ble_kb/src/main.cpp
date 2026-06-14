@@ -89,6 +89,7 @@ static bool isFnCommandKey(uint8_t usage) {
     if (usage >= 0x1E && usage < 0x1E + NUM_SLOTS) return true;  // 1..NUM_SLOTS
     if (usage == 0x27) return true;                              // 0  unpair
     if (usage == 0x2F || usage == 0x30) return true;            // [ ] brightness
+    if (usage == 0x0A) return true;                             // g  hidden game
     return false;
 }
 
@@ -287,6 +288,211 @@ static void unpairCurrentSlot() {
     ESP.restart();
 }
 
+// ---- hidden mini-game: a Chrome-dino-style runner (Fn+G) ----
+// Self-contained: runs its own loop with M5Canvas double-buffering,
+// reads the keyboard directly, returns to the keyboard UI on Esc. BLE
+// stays connected; we just don't send HID while playing. Space = jump,
+// Esc (the ` key) = quit. Rendered as the white-on-black "night mode"
+// Chrome dino. The character/obstacle art is defined as pixel grids
+// below so it's easy to read and tweak.
+
+// Original homage art (not Google's asset): a chunky right-facing
+// runner drawn body + animated legs so it shuffles like the Chrome
+// dino while keeping its own silhouette.
+static const char *DINO_BODY[] = {
+    "           ######   ",
+    "           #######  ",
+    "           ## ####  ",   // eye = the gap
+    "           #######  ",
+    "           #######  ",
+    "           ####### #",
+    "  #        #######  ",
+    "  ##       #######  ",
+    "  ###      #######  ",
+    "   #####  ######### ",
+    "   ################ ",
+    "   ################ ",
+    "  ################  ",
+    "   ##############   ",
+    "   #############    ",
+    "   ###########      ",
+    "   ##########       ",
+};
+static const char *DINO_LEGS_STAND[] = {
+    "   ###  ###         ",
+    "   ##    ##         ",
+    "   ##    ##         ",
+    "   #     #          ",
+    "   #     #          ",
+};
+static const char *DINO_LEGS_RUN1[] = {
+    "   ###  ###         ",
+    "   ##    ##         ",
+    "    #    ##         ",
+    "         #          ",
+    "         #          ",
+};
+static const char *DINO_LEGS_RUN2[] = {
+    "   ###  ###         ",
+    "   ##    ##         ",
+    "   ##    #          ",
+    "   #                ",
+    "   #                ",
+};
+static const int DINO_BODY_H = 17, DINO_H = 22;
+
+static const char *CACTUS_ART[] = {
+    "  ##  ",
+    "  ##  ",
+    "# ## #",
+    "# ## #",
+    "######",
+    "  ##  ",
+    "  ##  ",
+    "  ##  ",
+    "  ##  ",
+    "  ##  ",
+    "  ##  ",
+    "  ##  ",
+    "  ##  ",
+    "  ##  ",
+    "  ##  ",
+    "  ##  ",
+};
+static const int CACTUS_W = 6, CACTUS_H = 16;
+
+static void drawArt(M5Canvas &cv, int x, int y, const char *const *art,
+                    int rows, uint16_t color) {
+    for (int r = 0; r < rows; r++) {
+        const char *line = art[r];
+        for (int c = 0; line[c]; c++)
+            if (line[c] == '#') cv.drawPixel(x + c, y + r, color);
+    }
+}
+
+static void playDino() {
+    auto &disp = M5Cardputer.Display;
+    uint8_t savedBright = dispBright;
+    disp.setBrightness(160);  // the 10% default would be too dark to play
+
+    M5Canvas cv(&disp);
+    if (cv.createSprite(240, 135) == nullptr) {
+        disp.fillScreen(COL_BLACK);
+        disp.setTextColor(COL_ORANGE, COL_BLACK);
+        disp.setTextSize(1);
+        disp.drawString("game: low memory", 20, 60);
+        delay(1200);
+        disp.setBrightness(savedBright);
+        return;
+    }
+
+    const int groundY = 118;
+    const int dinoX = 24;
+    // Physics matched to the Chrome runner's feel at 60 fps: gravity
+    // 0.6/frame, a ~0.5 s jump arc, sub-pixel horizontal motion, and a
+    // shorter hop when Space is released early (variable-height jump).
+    const float GRAVITY = 0.6f;
+    const float JUMP_V = -8.8f;
+    const float SPEED0 = 2.6f, SPEED_MAX = 6.0f, SPEED_ACC = 0.0010f;
+
+    float dinoY = groundY - DINO_H, vy = 0;
+    bool onGround = true, gameOver = false, prevJump = false;
+
+    struct Obs { float x; int count; bool active; };  // count = adjacent cacti
+    Obs obs[3] = {};
+    int frames = 0, score = 0, best = 0;
+    float speed = SPEED0;
+    uint32_t lastSpawn = 0;
+    int spawnGap = 1100;
+    randomSeed(micros());
+
+    while (true) {
+        M5Cardputer.update();
+        auto ks = M5Cardputer.Keyboard.keysState();
+        bool jump = ks.space;
+        bool quit = false;
+        for (auto u : ks.hid_keys) if (u == 0x35) quit = true;  // ` / Esc
+        if (quit) break;
+
+        if (!gameOver) {
+            if (jump && !prevJump && onGround) { vy = JUMP_V; onGround = false; }
+            // Variable jump: rising with Space released -> fall faster.
+            vy += (!jump && vy < 0) ? GRAVITY * 2.2f : GRAVITY;
+            dinoY += vy;
+            if (dinoY >= groundY - DINO_H) { dinoY = groundY - DINO_H; vy = 0; onGround = true; }
+
+            uint32_t nowm = millis();
+            if (nowm - lastSpawn > (uint32_t)spawnGap) {
+                for (auto &o : obs) if (!o.active) {
+                    o.active = true; o.x = 240; o.count = 1 + random(0, 3);
+                    break;
+                }
+                lastSpawn = nowm;
+                spawnGap = 600 + random(0, 700);
+            }
+
+            for (auto &o : obs) if (o.active) {
+                o.x -= speed;
+                int ow = o.count * CACTUS_W;
+                if (o.x + ow < 0) o.active = false;
+                bool xo = o.x < dinoX + 17 && o.x + ow > dinoX + 3;
+                bool yo = (dinoY + DINO_H) > (groundY - CACTUS_H);
+                if (xo && yo) gameOver = true;
+            }
+
+            if (++frames % 3 == 0) score++;
+            speed += SPEED_ACC;
+            if (speed > SPEED_MAX) speed = SPEED_MAX;
+        } else {
+            if (score > best) best = score;
+            if (jump && !prevJump) {  // retry
+                gameOver = false; score = 0; frames = 0; speed = SPEED0;
+                dinoY = groundY - DINO_H; vy = 0; onGround = true;
+                for (auto &o : obs) o.active = false;
+                lastSpawn = millis();
+            }
+        }
+        prevJump = jump;
+
+        cv.fillSprite(COL_BLACK);
+        cv.drawFastHLine(0, groundY, 240, COL_CREAM);
+        // dino: body + animated legs (legs hold still while airborne)
+        drawArt(cv, dinoX, (int)dinoY, DINO_BODY, DINO_BODY_H, COL_CREAM);
+        const char *const *legs = !onGround ? DINO_LEGS_STAND
+                                  : ((frames / 6) % 2 ? DINO_LEGS_RUN1 : DINO_LEGS_RUN2);
+        drawArt(cv, dinoX, (int)dinoY + DINO_BODY_H, legs, 5, COL_CREAM);
+        for (auto &o : obs) if (o.active)
+            for (int i = 0; i < o.count; i++)
+                drawArt(cv, (int)o.x + i * CACTUS_W, groundY - CACTUS_H,
+                        CACTUS_ART, CACTUS_H, COL_CREAM);
+
+        cv.setTextSize(1);
+        cv.setTextColor(COL_GRAY);
+        cv.drawString("Fn-game  Esc=quit", 4, 4);
+        cv.setTextColor(COL_CREAM);
+        char s[24];
+        snprintf(s, sizeof(s), "%05d", score);
+        cv.drawString(s, 240 - cv.textWidth(s) - 4, 4);
+        if (gameOver) {
+            cv.setTextSize(2);
+            cv.setTextColor(COL_ORANGE);
+            cv.drawString("GAME OVER", (240 - cv.textWidth("GAME OVER")) / 2, 42);
+            cv.setTextSize(1);
+            cv.setTextColor(COL_CREAM);
+            snprintf(s, sizeof(s), "score %d   best %d", score, best);
+            cv.drawString(s, (240 - cv.textWidth(s)) / 2, 66);
+            cv.setTextColor(COL_GRAY);
+            const char *r = "Space=retry  Esc=quit";
+            cv.drawString(r, (240 - cv.textWidth(r)) / 2, 80);
+        }
+        cv.pushSprite(0, 0);
+        delay(16);  // ~60 fps
+    }
+
+    cv.deleteSprite();
+    disp.setBrightness(savedBright);
+}
+
 // ---- runtime state ----
 
 enum Disp { D_STATUS, D_GUIDE };
@@ -402,6 +608,7 @@ void loop() {
                     else if (u == 0x27) unpairCurrentSlot();
                     else if (u == 0x2F) { adjustBrightness(-BRIGHT_STEP); forceRedraw = true; }
                     else if (u == 0x30) { adjustBrightness(+BRIGHT_STEP); forceRedraw = true; }
+                    else if (u == 0x0A) { playDino(); forceRedraw = true; }  // Fn+G
                 }
             }
 

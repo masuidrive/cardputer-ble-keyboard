@@ -210,11 +210,10 @@ static void drawGuide() {
 
     d.setTextSize(2);
     d.setTextColor(COL_CREAM, COL_BLACK);
-    d.drawString("1/2/3 = host",  6, 34);
-    d.drawString("Space = EN",    6, 56);
-    d.drawString("Enter = JP",    6, 78);
+    d.drawString("1/2/3 = host",    6, 36);
+    d.drawString("Spc/Ent = EN/JP", 6, 64);
     d.setTextColor(COL_ORANGE, COL_BLACK);
-    d.drawString("0 = unpair",    6, 100);
+    d.drawString("0 = unpair",      6, 92);
 }
 
 // Persist the target slot and reboot into it.

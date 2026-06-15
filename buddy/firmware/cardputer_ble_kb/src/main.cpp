@@ -93,6 +93,17 @@ static bool isFnCommandKey(uint8_t usage) {
     return false;
 }
 
+// Tap Alt+Tab — Android's quick recent-app switch.
+static void sendAltTab() {
+    if (!kbd->isConnected()) return;
+    KeyReport r = {};
+    r.modifiers = 0x04;  // Left Alt
+    r.keys[0] = 0x2B;    // Tab
+    kbd->sendReport(&r);
+    KeyReport empty = {};
+    kbd->sendReport(&empty);
+}
+
 // Step the backlight brightness and persist it. Applied live so the
 // change is visible while the Fn guide is on screen.
 static void adjustBrightness(int delta) {
@@ -229,12 +240,41 @@ static void drawGuide() {
 
     d.setTextSize(2);
     d.setTextColor(COL_CREAM, COL_BLACK);
-    d.drawString("1/2/3/0=Host/unpair", 6, 40);
-    d.drawString("Spc/Ent = EN/JP",     6, 68);
+    d.drawString("1/2/3/0=Host/unpair", 6, 34);
+    d.drawString("Spc/Ent = EN/JP",     6, 58);
 
     char bl[20];
     snprintf(bl, sizeof(bl), "[ ]=bright %d%%", (int)dispBright * 100 / 255);
-    d.drawString(bl, 6, 96);
+    d.drawString(bl, 6, 82);
+
+    d.setTextColor(COL_GRAY, COL_BLACK);
+    d.drawString("+Ctrl: Android nav", 6, 106);
+}
+
+// Shown while Fn+Ctrl is held: the Android system-navigation keys.
+static void drawNavGuide() {
+    auto &d = M5Cardputer.Display;
+    d.fillScreen(COL_BLACK);
+
+    d.fillRect(0, 0, d.width(), 24, COL_DARK);
+    d.fillRect(0, 24, d.width(), 1, COL_ORANGE);
+    d.setTextSize(2);
+    d.setTextColor(COL_ORANGE, COL_DARK);
+    d.drawString("Fn+Ctrl", 6, 4);
+
+    int32_t batt = M5.Power.getBatteryLevel();
+    char bat[8];
+    if (batt >= 0) snprintf(bat, sizeof(bat), "%ld%%", (long)batt);
+    else           snprintf(bat, sizeof(bat), "--");
+    d.setTextColor(batt >= 0 && batt <= 20 ? COL_ORANGE : COL_CREAM, COL_DARK);
+    d.drawString(bat, d.width() - d.textWidth(bat) - 6, 4);
+
+    d.setTextSize(2);
+    d.setTextColor(COL_CREAM, COL_BLACK);
+    d.drawString("H = Home",   6, 34);
+    d.drawString("B = Back",   6, 58);
+    d.drawString("A = Apps",   6, 82);
+    d.drawString("S = Search", 6, 106);
 }
 
 // Persist the target slot and reboot into it.
@@ -495,7 +535,7 @@ static void playDino() {
 
 // ---- runtime state ----
 
-enum Disp { D_STATUS, D_GUIDE };
+enum Disp { D_STATUS, D_GUIDE, D_GUIDE_NAV };
 static Disp dispMode = D_STATUS;
 static bool forceRedraw = false;
 static bool lastConnected = false;
@@ -556,6 +596,7 @@ void loop() {
     uint32_t now = millis();
     Keyboard_Class::KeysState st = M5Cardputer.Keyboard.keysState();
     bool fnHeld = st.fn;
+    bool ctrlHeld = st.ctrl;
 
     bool connected = kbd->isConnected();
     if (connected != lastConnected) {
@@ -586,17 +627,19 @@ void loop() {
 
     // Always-on display: status is shown continuously; holding Fn
     // overrides it with the shortcut guide.
-    Disp want = fnHeld ? D_GUIDE : D_STATUS;
+    Disp want = fnHeld ? (ctrlHeld ? D_GUIDE_NAV : D_GUIDE) : D_STATUS;
     if (want != dispMode || forceRedraw) {
         dispMode = want;
         forceRedraw = false;
         M5Cardputer.Display.setBrightness(dispBright);
         if (want == D_GUIDE) drawGuide();
+        else if (want == D_GUIDE_NAV) drawNavGuide();
         else drawStatus(connected);
     }
 
     if (M5Cardputer.Keyboard.isChange()) {
         KeyReport report = {};
+        bool navDone = false;
         if (M5Cardputer.Keyboard.isPressed()) {
             Keyboard_Class::KeysState ks = M5Cardputer.Keyboard.keysState();
 
@@ -612,27 +655,42 @@ void loop() {
                 }
             }
 
-            if (ks.ctrl)  report.modifiers |= 0x01;  // Left Ctrl
-            if (ks.shift) report.modifiers |= 0x02;  // Left Shift
-            if (ks.opt)   report.modifiers |= 0x04;  // Left Alt (Option)
-            if (ks.alt)   report.modifiers |= 0x08;  // Left GUI (Command)
-
-            int n = 0;
-            for (auto usage : ks.hid_keys) {
-                if (ks.fn && isFnCommandKey(usage)) continue;  // swallow 1/2/3/0
-                addKey(report, n, ks.fn ? fnRemap(usage) : usage);
+            // Fn+Ctrl + letter = Android system navigation. Suppresses
+            // normal output (navDone), one tap per press (isChange-gated).
+            // Acts as the system buttons on Android; on macOS AC Home/Back
+            // map to browser home/back, which is harmless.
+            if (ks.fn && ks.ctrl) {
+                for (auto u : ks.hid_keys) {
+                    if (u == 0x0B) { kbd->write(KEY_MEDIA_WWW_HOME); navDone = true; }    // H Home
+                    else if (u == 0x05) { kbd->write(KEY_MEDIA_WWW_BACK); navDone = true; }   // B Back
+                    else if (u == 0x04) { sendAltTab(); navDone = true; }                 // A App switch
+                    else if (u == 0x16) { kbd->write(KEY_MEDIA_WWW_SEARCH); navDone = true; } // S Search
+                }
             }
-            // Belt and braces: the dedicated state flags cover keys
-            // some library versions report only as flags. addKey
-            // dedupes, so double-reporting is harmless. Fn remaps
-            // match fnRemap(): Fn+Enter->LANG1 (かな), Fn+Space->LANG2
-            // (英数), Fn+Backspace->Forward Delete.
-            if (ks.enter) addKey(report, n, ks.fn ? 0x90 : 0x28);
-            if (ks.space) addKey(report, n, ks.fn ? 0x91 : 0x2C);
-            if (ks.tab)   addKey(report, n, 0x2B);
-            if (ks.del)   addKey(report, n, ks.fn ? 0x4C : 0x2A);
+
+            if (!navDone) {
+                if (ks.ctrl)  report.modifiers |= 0x01;  // Left Ctrl
+                if (ks.shift) report.modifiers |= 0x02;  // Left Shift
+                if (ks.opt)   report.modifiers |= 0x04;  // Left Alt (Option)
+                if (ks.alt)   report.modifiers |= 0x08;  // Left GUI (Command)
+
+                int n = 0;
+                for (auto usage : ks.hid_keys) {
+                    if (ks.fn && isFnCommandKey(usage)) continue;  // swallow 1/2/3/0
+                    addKey(report, n, ks.fn ? fnRemap(usage) : usage);
+                }
+                // Belt and braces: the dedicated state flags cover keys
+                // some library versions report only as flags. addKey
+                // dedupes, so double-reporting is harmless. Fn remaps
+                // match fnRemap(): Fn+Enter->LANG1 (かな), Fn+Space->LANG2
+                // (英数), Fn+Backspace->Forward Delete.
+                if (ks.enter) addKey(report, n, ks.fn ? 0x90 : 0x28);
+                if (ks.space) addKey(report, n, ks.fn ? 0x91 : 0x2C);
+                if (ks.tab)   addKey(report, n, 0x2B);
+                if (ks.del)   addKey(report, n, ks.fn ? 0x4C : 0x2A);
+            }
         }
-        if (connected) {
+        if (connected && !navDone) {
             kbd->sendReport(&report);
         }
     }
